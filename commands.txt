@@ -1,0 +1,8 @@
+start - Start the bot and see welcome message
+reset - Clear conversation history
+model - View or switch AI model
+models - List available AI models
+help - Show help message
+adduser - Grant user access (admin only)
+removeuser - Revoke user access (admin only)
+users - List allowed users (admin only)
