@@ -197,9 +197,10 @@ class TelegramBot:
         )
 
         # Respond if: trigger keyword, mentions bot, or replies to bot
+        text_lower = message.text.lower()
         if not (
             message.text.startswith(trigger)
-            or (bot_username and f"@{bot_username}" in message.text)
+            or (bot_username and f"@{bot_username.lower()}" in text_lower)
             or is_reply_to_bot
         ):
             return
@@ -340,6 +341,13 @@ class TelegramBot:
 
         query = cached["query"]
         user_id = cached["user_id"]
+
+        # Only the user who sent the inline query can click Generate
+        if callback_query.from_user.id != user_id:
+            self.inline_queries_cache[result_id] = cached  # restore cache for the real user
+            await callback_query.answer("Only the sender can generate.", show_alert=True)
+            return
+
         inline_message_id = callback_query.inline_message_id
 
         # Rate limit check
