@@ -1,0 +1,9 @@
+kurigram
+tgcrypto
+motor
+dnspython
+python-dotenv
+openai
+tenacity
+pydub
+httpx
