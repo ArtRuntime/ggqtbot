@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Containerfile
+    container_name: ggqtbot
+    restart: always
+    env_file:
+      - .env
+    depends_on:
+      - mongo
+    volumes:
+      - ./data:/app/data:Z
+
+  mongo:
+    image: docker.io/library/mongo:7
+    container_name: ggqtbot_mongo
+    restart: always
+    volumes:
+      - mongo_data:/data/db:Z
+    ports:
+      - "127.0.0.1:27017:27017"
+
+volumes:
+  mongo_data:
