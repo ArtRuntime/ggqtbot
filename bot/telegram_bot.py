@@ -52,6 +52,7 @@ class TelegramBot:
         self.app.on_message(filters.sticker)(self._handle_sticker)
         self.app.on_inline_query()(self._handle_inline)
         self.app.on_callback_query(filters.regex(r"^gen:"))(self._handle_generate_callback)
+        self.app.on_callback_query(filters.regex(r"^setmodel:"))(self._handle_set_model_callback)
 
     def _is_admin(self, user_id: int) -> bool:
         return user_id in self.config.admin_user_ids
@@ -142,18 +143,32 @@ class TelegramBot:
         self._rate_limits[user_id].append(now)
         return False
 
+    def _build_models_keyboard(self, models: list[str], current_model: str) -> InlineKeyboardMarkup:
+        """Build an inline keyboard menu for available models."""
+        buttons = []
+        for idx, m in enumerate(models):
+            is_active = (m == current_model)
+            prefix = "✅ " if is_active else "🤖 "
+            label = f"{prefix}{m}"
+            buttons.append([InlineKeyboardButton(label, callback_data=f"setmodel:{idx}")])
+        return InlineKeyboardMarkup(buttons)
+
     async def _models(self, client: Client, message: Message):
         if not await self._is_allowed(message.from_user.id):
             await self._deny_access(message)
             return
         models = await self.openai.get_models()
-        current = self.openai.get_current_model()
-        text = "Available models:\n\n"
-        for m in models:
-            marker = " (current)" if m == current else ""
-            text += f"• `{m}`{marker}\n"
-        text += f"\nUse /model <name> to switch."
-        await message.reply_text(text)
+        user_id = message.from_user.id
+        user_model = await self.db.get_user_model(user_id)
+        current = user_model or self.openai.get_current_model()
+
+        text = (
+            "🤖 **Select Your AI Model**\n\n"
+            f"Active model: `{current}`\n\n"
+            "Click any model below to select it, or use `/model <name>`:"
+        )
+        markup = self._build_models_keyboard(models, current)
+        await message.reply_text(text, reply_markup=markup)
 
     async def _model(self, client: Client, message: Message):
         if not await self._is_allowed(message.from_user.id):
@@ -162,9 +177,7 @@ class TelegramBot:
         user_id = message.from_user.id
         parts = message.text.split(maxsplit=1)
         if len(parts) < 2:
-            user_model = await self.db.get_user_model(user_id)
-            current = user_model or self.openai.get_current_model()
-            await message.reply_text(f"Current model: `{current}`\nUse /model <name> to switch.")
+            await self._models(client, message)
             return
         model_name = parts[1].strip()
         models = await self.openai.get_models()
@@ -172,7 +185,43 @@ class TelegramBot:
             await message.reply_text(f"Model `{model_name}` not found. Use /models to list available.")
             return
         await self.db.set_user_model(user_id, model_name)
-        await message.reply_text(f"Switched to `{model_name}`.")
+        await message.reply_text(f"Switched model to `{model_name}`.")
+
+    async def _handle_set_model_callback(self, client: Client, callback_query):
+        user_id = callback_query.from_user.id
+        if not await self._is_allowed(user_id):
+            await callback_query.answer("Access denied.", show_alert=True)
+            return
+
+        data = callback_query.data  # "setmodel:<idx>"
+        try:
+            idx = int(data.split(":", 1)[1])
+            models = await self.openai.get_models()
+            if idx < 0 or idx >= len(models):
+                await callback_query.answer("Model not found.", show_alert=True)
+                return
+            target_model = models[idx]
+        except (ValueError, IndexError):
+            await callback_query.answer("Invalid selection.", show_alert=True)
+            return
+
+        await self.db.set_user_model(user_id, target_model)
+        await callback_query.answer(f"Switched model to: {target_model}")
+
+        # Delete the buttons message
+        try:
+            await callback_query.message.delete()
+        except Exception as e:
+            logger.debug(f"Failed to delete models message: {e}")
+
+        # Send confirmation message
+        try:
+            await client.send_message(
+                chat_id=callback_query.message.chat.id,
+                text=f"✅ Switched model to `{target_model}`."
+            )
+        except Exception as e:
+            logger.debug(f"Failed to send model confirmation message: {e}")
 
     async def _handle_message(self, client: Client, message: Message):
         if not await self._is_allowed(message.from_user.id):
@@ -181,7 +230,7 @@ class TelegramBot:
         await self._respond(message, message.text)
 
     async def _handle_group_message(self, client: Client, message: Message):
-        if not message.text:
+        if not message.text or not message.from_user:
             return
 
         me = await client.get_me()
@@ -211,14 +260,14 @@ class TelegramBot:
         if text.startswith(trigger):
             text = text[len(trigger):].strip()
         text = text.replace(f"@{bot_username}", "").strip() if bot_username else text
-        if not text:
+        if not text and not message.reply_to_message:
             return
 
         # Use feminine persona when replying to bot's message
         if is_reply_to_bot:
-            await self._respond(message, text, persona="woman")
+            await self._respond(message, text or "[replied to bot]", persona="woman")
         else:
-            await self._respond(message, text)
+            await self._respond(message, text or "[replied to message]")
 
     async def _handle_sticker(self, client: Client, message: Message):
         """Reply to stickers with a related sticker from the configured pack."""
@@ -243,61 +292,145 @@ class TelegramBot:
             logger.error(f"Sticker handler error: {e}")
 
     async def _respond(self, message: Message, user_text: str, persona: str | None = None):
-        """Generate and stream an AI response."""
+        """Generate and stream an AI response with full chat, user profile, and reply context."""
         chat_id = message.chat.id
-        user_id = message.from_user.id
-        await self.db.track_user(user_id, message.from_user.username)
+        user_id = message.from_user.id if message.from_user else 0
+        username = message.from_user.username if message.from_user else None
+
+        if user_id:
+            await self.db.track_user(user_id, username)
 
         # Rate limit check
-        if not self._is_admin(user_id) and self._is_rate_limited(user_id):
+        if user_id and not self._is_admin(user_id) and self._is_rate_limited(user_id):
             await message.reply_text("You're sending too fast. Please wait a moment.")
             return
 
         # Resolve per-user model
-        user_model = await self.db.get_user_model(user_id)
+        user_model = await self.db.get_user_model(user_id) if user_id else None
+
+        # 1. Chat Context
+        chat_title = message.chat.title or message.chat.first_name or "Private Chat"
+        chat_type_str = str(message.chat.type).split(".")[-1].upper() if hasattr(message.chat, "type") else "CHAT"
+        chat_context = f"Chat Name: '{chat_title}' (ID: {chat_id}, Type: {chat_type_str})"
+
+        # 2. Sender Profile Context (Name, ID, Username, Bio)
+        sender = message.from_user
+        sender_id = sender.id if sender else 0
+        sender_name = f"{sender.first_name or ''} {sender.last_name or ''}".strip() if sender else "Unknown"
+        sender_uname_str = f"@{sender.username}" if sender and sender.username else "None"
+        sender_bio = "Not set / Private"
+
+        if sender and sender.id:
+            try:
+                user_chat = await self.app.get_chat(sender.id)
+                if user_chat and user_chat.bio:
+                    sender_bio = user_chat.bio
+            except Exception:
+                pass
+
+        user_context = (
+            f"User Speaking with You:\n"
+            f"- Name: {sender_name}\n"
+            f"- User ID: {sender_id}\n"
+            f"- Username: {sender_uname_str}\n"
+            f"- Bio: {sender_bio}"
+        )
+
+        # 3. Replied Message Context
+        reply_context = ""
+        if message.reply_to_message:
+            r_msg = message.reply_to_message
+            r_sender = r_msg.from_user
+            r_name = f"{r_sender.first_name or ''} {r_sender.last_name or ''}".strip() if r_sender else "Unknown"
+            r_uname_str = f"@{r_sender.username}" if r_sender and r_sender.username else "None"
+            r_id = r_sender.id if r_sender else "Unknown"
+            r_text = r_msg.text or r_msg.caption or "[Media / Non-text content]"
+
+            reply_context = (
+                f"\n\nContext - Replying to message:\n"
+                f"- Original Author: {r_name} (ID: {r_id}, Username: {r_uname_str})\n"
+                f"- Original Content: \"{r_text}\""
+            )
+
+        context_prompt = (
+            f"### Current Context:\n"
+            f"- {chat_context}\n"
+            f"- {user_context}"
+            f"{reply_context}\n\n"
+            "Use this context naturally to personalize your output and accurately address replied messages."
+        )
 
         # Choose system prompt based on persona
         if persona == "woman":
-            system_prompt = (
+            base_prompt = (
                 "You are a real human woman chatting casually on Telegram. "
                 "You're warm, playful, witty, and natural. You use casual language, "
                 "short sentences, and sometimes emojis. Never reveal you are an AI. "
                 "Respond like a real person would in a group chat."
             )
         else:
-            system_prompt = self.config.openai_system_prompt
+            base_prompt = self.config.openai_system_prompt
+
+        system_prompt = f"{base_prompt}\n\n{context_prompt}"
+
+        # Format user prompt with speaker info
+        formatted_user_input = f"[{sender_name} ({sender_uname_str})]: {user_text}"
 
         # Build messages with history
         history = await self.db.get_conversation(chat_id)
         messages = [{"role": "system", "content": system_prompt}]
         messages.extend(history)
-        messages.append({"role": "user", "content": user_text})
+        messages.append({"role": "user", "content": formatted_user_input})
+
+        # Send typing action status
+        try:
+            await self.app.send_chat_action(chat_id, enums.ChatAction.TYPING)
+        except Exception as e:
+            logger.debug(f"Failed to send typing action: {e}")
 
         # Send placeholder
         reply = await message.reply_text("...")
 
-        # Stream response with periodic edits
+        # Stream response with periodic edits & typing action refresh
         full_response = ""
+        actual_model_used = user_model or self.openai.get_current_model()
         last_edit = time.time()
+        last_typing = time.time()
         try:
-            async for chunk in self.openai.chat_completion_stream(messages, model=user_model):
+            async for chunk, model_used in self.openai.chat_completion_stream(messages, model=user_model):
                 full_response += chunk
-                if time.time() - last_edit >= self.config.stream_update_interval:
+                actual_model_used = model_used
+                now = time.time()
+                if now - last_typing >= 4.0:
+                    try:
+                        await self.app.send_chat_action(chat_id, enums.ChatAction.TYPING)
+                    except Exception:
+                        pass
+                    last_typing = now
+                if now - last_edit >= self.config.stream_update_interval:
                     await reply.edit_text(full_response + " ▌", parse_mode=enums.ParseMode.DISABLED)
-                    last_edit = time.time()
+                    last_edit = now
 
             # Final edit
             if full_response:
                 await reply.edit_text(full_response, parse_mode=enums.ParseMode.DISABLED)
             else:
                 await reply.edit_text("(empty response)", parse_mode=enums.ParseMode.DISABLED)
+
+            # Send second message ONLY if user's requested model failed and fallback was triggered
+            if user_model and actual_model_used != user_model:
+                await message.reply_text(
+                    f"💡 Note: Your selected model `{user_model}` was unavailable or failed, "
+                    f"so we used the active fallback model `{actual_model_used}` instead. "
+                    "You can switch models using /models."
+                )
         except Exception as e:
             logger.error(f"Error generating response: {e}")
             await reply.edit_text("Something went wrong. Try again later.", parse_mode=enums.ParseMode.DISABLED)
             return
 
-        # Save to history
-        await self.db.add_message(chat_id, "user", user_text)
+        # Save formatted input and response to history
+        await self.db.add_message(chat_id, "user", formatted_user_input)
         await self.db.add_message(chat_id, "assistant", full_response)
 
     async def _handle_inline(self, client: Client, inline_query: InlineQuery):
@@ -410,8 +543,8 @@ class TelegramBot:
 
     async def run(self):
         await self.db.init()
-        await self.openai.get_models()
-        logger.info(f"Using model: {self.openai.get_current_model()}")
+        working_model = await self.openai.find_working_default_model()
+        logger.info(f"Active working default model: {working_model}")
         await self.app.start()
         logger.info("Bot started.")
         await asyncio.Event().wait()  # run forever
