@@ -63,7 +63,14 @@ class Database:
         return messages[-self.config.max_history_size :]
 
     async def add_message(self, chat_id: int, role: str, content: str):
-        """Add a message to conversation history."""
+        """Add a message to conversation history, clearing expired history if cutoff reached."""
+        cutoff = datetime.now() - timedelta(
+            minutes=self.config.max_conversation_age_minutes
+        )
+        doc = await self.conversations.find_one({"chat_id": chat_id}, {"updated_at": 1})
+        if doc and doc.get("updated_at") and doc["updated_at"] < cutoff:
+            await self.reset_conversation(chat_id)
+
         message = {"role": role, "content": content}
         await self.conversations.update_one(
             {"chat_id": chat_id},

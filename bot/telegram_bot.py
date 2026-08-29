@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import random
+import re
 import time
 from collections import defaultdict
 from uuid import uuid4
@@ -14,9 +16,12 @@ from pyrogram.types import (
     Message,
 )
 
+from datetime import datetime
+
 from bot.config import Config
 from bot.database import Database
 from bot.openai_helper import OpenAIHelper
+from bot.web_search import WebSearch
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +40,7 @@ class TelegramBot:
         self.inline_queries_cache: dict[str, str] = {}
         self._rate_limits: dict[int, list[float]] = defaultdict(list)
         self._addapi_sessions: dict[int, dict] = {}
+        self._last_random_chat: dict[int, float] = defaultdict(float)
         self._register_handlers()
 
     def _register_handlers(self):
@@ -49,9 +55,10 @@ class TelegramBot:
         self.app.on_message(filters.command("addapi"))(self._addapi)
         self.app.on_message(filters.command("removeapi"))(self._removeapi)
         self.app.on_message(filters.command("apis"))(self._list_apis)
+        self.app.on_message(filters.command("search"))(self._search)
         self.app.on_message(filters.command("help"))(self._help)
         self.app.on_message(
-            filters.text & filters.private & ~filters.command(["start", "reset", "cancel", "model", "models", "help", "adduser", "removeuser", "users", "addapi", "removeapi", "apis"])
+            filters.text & filters.private & ~filters.command(["start", "reset", "cancel", "model", "models", "help", "adduser", "removeuser", "users", "addapi", "removeapi", "apis", "search"])
         )(self._handle_message)
         self.app.on_message(filters.text & filters.group)(self._handle_group_message)
         self.app.on_message(filters.sticker)(self._handle_sticker)
@@ -64,6 +71,30 @@ class TelegramBot:
 
     def _is_admin(self, user_id: int) -> bool:
         return user_id in self.config.admin_user_ids
+
+    @staticmethod
+    def _filter_links(text: str) -> str:
+        """Format domain names with a space before extension (e.g. instagram .com) to prevent Telegram auto-hyperlinking."""
+        if not text:
+            return ""
+        cleaned = re.sub(r'https?://\S+|www\.\S+|t\.me/\S+', '', text)
+        cleaned = re.sub(r'\[([^\]]*)\]\(\s*\)', r'\1', cleaned)
+        cleaned = re.sub(
+            r'\b([a-zA-Z0-9-]+)\.(com|org|net|io|me|ai|co|app|dev|xyz|info|edu|gov)\b',
+            r'\1 .\2',
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        return cleaned.strip()
+
+    async def _is_bot_admin_in_chat(self, chat_id: int) -> bool:
+        """Check if the bot has administrator status in the given chat."""
+        try:
+            member = await self.app.get_chat_member(chat_id, "me")
+            return member.status in (enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.OWNER)
+        except Exception as e:
+            logger.debug(f"Failed to check bot admin status in chat {chat_id}: {e}")
+            return False
 
     async def _is_allowed(self, user_id: int) -> bool:
         if self.config.allow_all_users:
@@ -374,6 +405,37 @@ class TelegramBot:
             text += f"• `{ep.get('name')}`: `{ep.get('base_url')}`\n"
         await message.reply_text(text)
 
+    async def _search(self, client: Client, message: Message):
+        if not await self._is_allowed(message.from_user.id):
+            await self._deny_access(message)
+            return
+        parts = message.text.split(maxsplit=1)
+        if len(parts) < 2:
+            await message.reply_text("Usage: /search <query>")
+            return
+        query = parts[1].strip()
+        status_msg = await message.reply_text("🔍 Searching the web...")
+        results = await WebSearch.search(query, max_results=4)
+        if not results:
+            await status_msg.edit_text(f"No web results found for `{query}`.")
+            return
+
+        chat_type = str(message.chat.type).split(".")[-1].lower() if hasattr(message.chat, "type") else "private"
+        is_private = (chat_type == "private")
+        is_admin = await self._is_bot_admin_in_chat(message.chat.id)
+        allow_links = is_private or is_admin
+
+        text = f"🌐 **Search Results for** `{query}`:\n\n"
+        for idx, r in enumerate(results, 1):
+            if allow_links and r.get("link"):
+                text += f"{idx}. **[{r['title']}]({r['link']})**\n{r['snippet']}\n\n"
+            else:
+                clean_title = self._filter_links(r['title'])
+                clean_snippet = self._filter_links(r['snippet'])
+                text += f"{idx}. **{clean_title}**\n{clean_snippet}\n\n"
+
+        await status_msg.edit_text(text)
+
     async def _deny_access(self, message: Message):
         await message.reply_text(
             "You don't have access to this bot.\n"
@@ -553,17 +615,34 @@ class TelegramBot:
             and message.reply_to_message.from_user.id == bot_id
         )
 
-        # Respond if: trigger keyword, mentions bot, or replies to bot
+        # Respond if: trigger keyword, mentions bot, replies to bot, OR random spontaneous chance
         text_lower = message.text.lower()
-        if not (
+        is_triggered = (
             message.text.startswith(trigger)
             or (bot_username and f"@{bot_username.lower()}" in text_lower)
             or is_reply_to_bot
-        ):
+        )
+
+        is_random_spontaneous = False
+        if not is_triggered:
+            chat_id = message.chat.id
+            now = time.time()
+            last_chat = self._last_random_chat[chat_id]
+            if (
+                now - last_chat >= self.config.random_group_chat_cooldown_seconds
+                and random.random() < self.config.random_group_chat_chance
+            ):
+                is_random_spontaneous = True
+                self._last_random_chat[chat_id] = now
+                logger.info(f"Triggered spontaneous random group chat response in group {chat_id}")
+
+        if not is_triggered and not is_random_spontaneous:
             return
+
         if not await self._is_allowed(message.from_user.id):
             await self._deny_access(message)
             return
+
         text = message.text
         if text.startswith(trigger):
             text = text[len(trigger):].strip()
@@ -571,8 +650,8 @@ class TelegramBot:
         if not text and not message.reply_to_message:
             return
 
-        # Use feminine persona when replying to bot's message
-        if is_reply_to_bot:
+        # Use feminine persona when replying to bot's message or spontaneous chat
+        if is_reply_to_bot or is_random_spontaneous:
             await self._respond(message, text or "[replied to bot]", persona="woman")
         else:
             await self._respond(message, text or "[replied to message]")
@@ -660,12 +739,44 @@ class TelegramBot:
                 f"- Original Content: \"{r_text}\""
             )
 
+        # 4. Check Bot Admin Status for Dynamic Link Permission
+        is_private = (chat_type_str == "PRIVATE")
+        is_bot_admin = await self._is_bot_admin_in_chat(chat_id)
+        allow_links = is_private or is_bot_admin
+
+        # 5. Real-time Date & Time Context
+        now_dt = datetime.now()
+        realtime_str = now_dt.strftime("%A, %B %d, %Y at %I:%M:%S %p")
+        realtime_context = f"📅 Real-Time Current Date & Time: {realtime_str}"
+
+        # 6. Dynamic Web Search Context
+        search_keywords = ("search", "who won", "latest", "today", "weather", "news", "price", "score", "current", "what is happening", "when did", "find out")
+        search_context = ""
+        if any(k in user_text.lower() for k in search_keywords):
+            search_results = await WebSearch.search(user_text, max_results=3)
+            if search_results:
+                if allow_links:
+                    snippets = "\n".join([f"• [{r['title']}]({r['link']}): {r['snippet']}" if r.get('link') else f"• {r['title']}: {r['snippet']}" for r in search_results])
+                else:
+                    from bot.web_search import clean_text_no_links
+                    snippets = "\n".join([f"• {clean_text_no_links(r['title'])}: {clean_text_no_links(r['snippet'])}" for r in search_results])
+                search_context = f"\n\n🌐 Live Web Search Results:\n{snippets}"
+
+        link_rule = (
+            "LINK PERMISSION: Links/URLs ARE ALLOWED in this chat. You may include relevant URLs when helpful."
+            if allow_links
+            else "LINK PERMISSION: Full URLs (http:// or https://) ARE STRICTLY BANNED in this chat because bot is not an admin. When referring to website addresses, format them with a space before the extension like 'instagram .com' or 'google .com' so Telegram does not auto-link them."
+        )
+
         context_prompt = (
-            f"### Current Context:\n"
+            f"### Current Real-Time Context:\n"
+            f"- {realtime_context}\n"
             f"- {chat_context}\n"
-            f"- {user_context}"
-            f"{reply_context}\n\n"
-            "Use this context naturally to personalize your output and accurately address replied messages."
+            f"- {user_context}\n"
+            f"- {link_rule}"
+            f"{reply_context}"
+            f"{search_context}\n\n"
+            "Use this real-time information naturally to provide precise, accurate, and up-to-date answers."
         )
 
         # Choose system prompt based on persona
@@ -716,14 +827,26 @@ class TelegramBot:
                         pass
                     last_typing = now
                 if now - last_edit >= self.config.stream_update_interval:
-                    await reply.edit_text(full_response + " ▌", parse_mode=enums.ParseMode.DISABLED)
+                    display_text = full_response if allow_links else self._filter_links(full_response)
+                    if len(display_text) > 3900:
+                        display_text = display_text[:3900]
+                    await reply.edit_text(display_text + " ▌", parse_mode=enums.ParseMode.DISABLED)
                     last_edit = now
 
-            # Final edit
-            if full_response:
-                await reply.edit_text(full_response, parse_mode=enums.ParseMode.DISABLED)
-            else:
+            # Final edit (filter links if bot is not admin in group, split if exceeding Telegram limit)
+            final_text = full_response if allow_links else self._filter_links(full_response)
+            if not final_text:
                 await reply.edit_text("(empty response)", parse_mode=enums.ParseMode.DISABLED)
+            elif len(final_text) <= 4000:
+                await reply.edit_text(final_text, parse_mode=enums.ParseMode.DISABLED)
+            else:
+                first_chunk = final_text[:4000]
+                await reply.edit_text(first_chunk, parse_mode=enums.ParseMode.DISABLED)
+                remaining = final_text[4000:]
+                while remaining:
+                    chunk = remaining[:4000]
+                    remaining = remaining[4000:]
+                    await message.reply_text(chunk, parse_mode=enums.ParseMode.DISABLED)
 
             # Send second message ONLY if user's requested model failed and fallback was triggered
             if user_model and actual_model_used != user_model:
@@ -851,8 +974,9 @@ class TelegramBot:
 
     async def run(self):
         await self.db.init()
-        working_model = await self.openai.find_working_default_model()
-        logger.info(f"Active working default model: {working_model}")
+        # Launch background model discovery non-blockingly so bot starts instantly!
+        asyncio.create_task(self.openai.start_background_model_discovery())
+        logger.info(f"Bot starting immediately with default fallback model: '{self.openai.get_current_model()}'")
         await self.app.start()
-        logger.info("Bot started.")
+        logger.info("Bot started and ready!")
         await asyncio.Event().wait()  # run forever

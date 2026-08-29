@@ -3,6 +3,7 @@ reset - Clear conversation history
 model - View or switch AI model
 models - List available AI models
 help - Show help message
+search - Search the web for live information
 adduser - Grant user access (admin only)
 removeuser - Revoke user access (admin only)
 users - List allowed users (admin only)

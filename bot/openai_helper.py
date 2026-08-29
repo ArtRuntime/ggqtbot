@@ -39,7 +39,7 @@ class OpenAIHelper:
         self._available_models: list[str] = []
         self._model_client_map: dict[str, AsyncOpenAI] = {}
         self._models_fetched_at: datetime | None = None
-        self._default_working_model: str | None = None
+        self._default_working_model: str = config.openai_model or "openrouter/free"
 
     async def get_models(self) -> list[str]:
         """Fetch available models dynamically from OpenRouter free models and all registered custom API endpoints."""
@@ -131,22 +131,22 @@ class OpenAIHelper:
         return self.client
 
     async def test_model(self, model: str, target_client: AsyncOpenAI | None = None) -> bool:
-        """Test if a model responds successfully to a minimal completion request."""
+        """Test if a model responds successfully to a completion request without retrying on 429/403 errors."""
         use_client = target_client or self._get_client_for_model(model)
         try:
             logger.info(f"Testing model: '{model}'...")
-            response = await asyncio.wait_for(
-                use_client.chat.completions.create(
+            res = await asyncio.wait_for(
+                use_client.chat.completions.with_raw_response.create(
                     model=model,
                     messages=[{"role": "user", "content": "hi"}],
                     max_tokens=5,
                 ),
-                timeout=10.0,
+                timeout=5.0,
             )
-            if response.choices and len(response.choices) > 0:
-                logger.info(f"Model '{model}' passed test.")
+            if res.status_code == 200:
+                logger.info(f"Model '{model}' passed test (HTTP 200).")
                 return True
-            logger.warning(f"Model '{model}' returned empty response during test.")
+            logger.warning(f"Model '{model}' failed test (HTTP {res.status_code}).")
             return False
         except Exception as e:
             logger.warning(f"Model '{model}' failed test: {e}")
@@ -181,40 +181,42 @@ class OpenAIHelper:
             "mistralai/mistral-7b-instruct:free",
         ]
 
-    async def find_working_default_model(self) -> str:
-        """Fetch models, test them sequentially from the first, and set the first working model as default/fallback."""
-        models = await self.get_models()
-        if not models:
-            logger.warning("No models found from endpoint.")
-            default = self.config.openai_model or "gpt-4.1-mini"
-            self._default_working_model = default
-            return default
+    async def start_background_model_discovery(self):
+        """Asynchronously discover and test models in parallel background task without delaying bot startup."""
+        logger.info(f"Starting background async model discovery. Initial fallback model: '{self._default_working_model}'")
+        try:
+            models = await self.get_models()
+            if not models:
+                logger.info(f"No models found from endpoints. Retaining fallback model: '{self._default_working_model}'")
+                return
 
-        test_queue = list(models)
-        if self.config.openai_model and self.config.openai_model in test_queue:
-            test_queue.remove(self.config.openai_model)
-            test_queue.insert(0, self.config.openai_model)
+            test_queue = list(models)
+            if self.config.openai_model and self.config.openai_model in test_queue:
+                test_queue.remove(self.config.openai_model)
+                test_queue.insert(0, self.config.openai_model)
 
-        for model in test_queue:
-            if await self.test_model(model):
-                self._default_working_model = model
-                logger.info(f"Selected '{model}' as default and fallback model.")
-                return model
+            # Test up to top 15 candidate models concurrently
+            candidates = test_queue[:15]
+            sem = asyncio.Semaphore(4)
 
-        # If primary endpoint models fail, test OpenRouter fallback models containing ':free'
-        if self.openrouter_client:
-            logger.warning("No primary models passed test. Testing OpenRouter free models...")
-            openrouter_models = await self.get_openrouter_free_models()
-            for om in openrouter_models:
-                if await self.test_model(om):
-                    self._default_working_model = om
-                    logger.info(f"Selected OpenRouter free model '{om}' as default fallback.")
-                    return om
+            async def check_candidate(m: str) -> str | None:
+                async with sem:
+                    if await self.test_model(m):
+                        return m
+                    return None
 
-        fallback = self.config.openai_model or models[0]
-        logger.warning(f"No models passed test. Falling back to '{fallback}'.")
-        self._default_working_model = fallback
-        return fallback
+            tasks = [asyncio.create_task(check_candidate(m)) for m in candidates]
+            for completed_task in asyncio.as_completed(tasks):
+                working = await completed_task
+                if working:
+                    self._default_working_model = working
+                    logger.info(f"Background model discovery complete. Active working default model set to: '{working}'")
+                    for t in tasks:
+                        if not t.done():
+                            t.cancel()
+                    break
+        except Exception as e:
+            logger.warning(f"Background model discovery error: {e}")
 
     def get_current_model(self) -> str:
         if self._default_working_model:
