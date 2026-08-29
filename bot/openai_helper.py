@@ -257,7 +257,6 @@ class OpenAIHelper:
 
         return (current, self.client)
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
     async def chat_completion_stream(
         self, messages: list[dict], model: str | None = None
     ) -> AsyncGenerator[tuple[str, str], None]:
