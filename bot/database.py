@@ -15,12 +15,39 @@ class Database:
         self.db = self.client[config.mongodb_db]
         self.conversations = self.db["conversations"]
         self.users = self.db["users"]
+        self.api_endpoints = self.db["api_endpoints"]
 
     async def init(self):
         """Create indexes."""
         await self.conversations.create_index("chat_id")
         await self.conversations.create_index("updated_at")
         await self.users.create_index("user_id", unique=True)
+        await self.api_endpoints.create_index("name", unique=True)
+
+    async def add_api_endpoint(self, name: str, base_url: str, api_key: str = ""):
+        """Add or update a custom OpenAI-compatible API endpoint."""
+        await self.api_endpoints.update_one(
+            {"name": name},
+            {
+                "$set": {
+                    "name": name,
+                    "base_url": base_url,
+                    "api_key": api_key,
+                    "updated_at": datetime.now(),
+                }
+            },
+            upsert=True,
+        )
+
+    async def remove_api_endpoint(self, name: str) -> bool:
+        """Remove a custom API endpoint."""
+        res = await self.api_endpoints.delete_one({"name": name})
+        return res.deleted_count > 0
+
+    async def get_api_endpoints(self) -> list[dict]:
+        """Get all custom registered API endpoints."""
+        cursor = self.api_endpoints.find()
+        return await cursor.to_list(length=100)
 
     async def get_conversation(self, chat_id: int) -> list[dict]:
         """Get conversation history for a chat."""

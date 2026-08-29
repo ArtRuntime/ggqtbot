@@ -22,8 +22,8 @@ async def main():
         logger.error("TELEGRAM_API_ID and TELEGRAM_API_HASH are required")
         return
 
-    openai = OpenAIHelper(config)
     db = Database(config)
+    openai = OpenAIHelper(config, db)
     bot = TelegramBot(config, openai, db)
 
     logger.info("Starting ggqtbot...")

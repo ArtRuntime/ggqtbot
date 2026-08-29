@@ -4,6 +4,7 @@ motor
 dnspython
 python-dotenv
 openai
+openrouter
 tenacity
 pydub
 httpx

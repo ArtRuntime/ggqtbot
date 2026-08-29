@@ -6,3 +6,6 @@ help - Show help message
 adduser - Grant user access (admin only)
 removeuser - Revoke user access (admin only)
 users - List allowed users (admin only)
+addapi - Add custom OpenAI API endpoint (admin only)
+removeapi - Remove custom API endpoint (admin only)
+apis - List custom API endpoints (admin only)

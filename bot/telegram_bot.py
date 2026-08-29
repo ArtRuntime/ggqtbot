@@ -34,25 +34,33 @@ class TelegramBot:
         )
         self.inline_queries_cache: dict[str, str] = {}
         self._rate_limits: dict[int, list[float]] = defaultdict(list)
+        self._addapi_sessions: dict[int, dict] = {}
         self._register_handlers()
 
     def _register_handlers(self):
         self.app.on_message(filters.command("start") & filters.private)(self._start)
         self.app.on_message(filters.command("reset") & filters.private)(self._reset)
+        self.app.on_message(filters.command("cancel") & filters.private)(self._cancel_session)
         self.app.on_message(filters.command("model"))(self._model)
         self.app.on_message(filters.command("models"))(self._models)
         self.app.on_message(filters.command("adduser"))(self._adduser)
         self.app.on_message(filters.command("removeuser"))(self._removeuser)
         self.app.on_message(filters.command("users"))(self._list_users)
+        self.app.on_message(filters.command("addapi"))(self._addapi)
+        self.app.on_message(filters.command("removeapi"))(self._removeapi)
+        self.app.on_message(filters.command("apis"))(self._list_apis)
         self.app.on_message(filters.command("help"))(self._help)
         self.app.on_message(
-            filters.text & filters.private & ~filters.command(["start", "reset", "model", "models", "help", "adduser", "removeuser", "users"])
+            filters.text & filters.private & ~filters.command(["start", "reset", "cancel", "model", "models", "help", "adduser", "removeuser", "users", "addapi", "removeapi", "apis"])
         )(self._handle_message)
         self.app.on_message(filters.text & filters.group)(self._handle_group_message)
         self.app.on_message(filters.sticker)(self._handle_sticker)
         self.app.on_inline_query()(self._handle_inline)
         self.app.on_callback_query(filters.regex(r"^gen:"))(self._handle_generate_callback)
+        self.app.on_callback_query(filters.regex(r"^models_page:"))(self._handle_models_page_callback)
+        self.app.on_callback_query(filters.regex(r"^models_cancel$"))(self._handle_models_cancel_callback)
         self.app.on_callback_query(filters.regex(r"^setmodel:"))(self._handle_set_model_callback)
+        self.app.on_callback_query(filters.regex(r"^removeapi:"))(self._handle_remove_api_callback)
 
     def _is_admin(self, user_id: int) -> bool:
         return user_id in self.config.admin_user_ids
@@ -79,7 +87,37 @@ class TelegramBot:
         await message.reply_text("Conversation reset.")
 
     async def _help(self, client: Client, message: Message):
-        await self._start(client, message)
+        user_id = message.from_user.id
+        is_admin = self._is_admin(user_id)
+
+        text = (
+            "🤖 **GGQT BOT HELP & COMMANDS**\n\n"
+            "💬 **Chat & Interaction**\n"
+            "• Direct message me anytime to start chatting.\n"
+            "• In groups, trigger me with `/chat <message>` or reply directly to my messages.\n"
+            "• Mention or reply to existing messages for contextual conversations.\n\n"
+            "⚙️ **User Commands**\n"
+            "• `/start` — Welcome message & bot status\n"
+            "• `/models` — Interactive menu to browse & pick AI models (9 per page)\n"
+            "• `/model <name>` — Direct model selector\n"
+            "• `/reset` — Clear your conversation memory history\n"
+            "• `/help` — Display this help menu\n\n"
+        )
+
+        if is_admin:
+            text += (
+                "👑 **Admin Commands**\n"
+                "• `/addapi` — Interactive wizard to add a custom OpenAI-compatible API\n"
+                "• `/removeapi` — Remove custom API endpoints via interactive buttons\n"
+                "• `/apis` — List all registered custom API endpoints\n"
+                "• `/adduser <id>` — Grant user access\n"
+                "• `/removeuser <id>` — Revoke user access\n"
+                "• `/users` — List allowed users\n"
+                "• `/cancel` — Cancel an active setup session\n\n"
+            )
+
+        text += "💡 **Pro Tip**: Use `/models` to switch between OpenRouter free models & custom endpoints!"
+        await message.reply_text(text)
 
     async def _adduser(self, client: Client, message: Message):
         if not self._is_admin(message.from_user.id):
@@ -128,6 +166,214 @@ class TelegramBot:
             text += f"• {uid} (@{uname})\n"
         await message.reply_text(text)
 
+    async def _cancel_session(self, client: Client, message: Message):
+        user_id = message.from_user.id
+        if user_id in self._addapi_sessions:
+            del self._addapi_sessions[user_id]
+            await message.reply_text("❌ API setup session cancelled.")
+        else:
+            await message.reply_text("No active setup session to cancel.")
+
+    async def _addapi(self, client: Client, message: Message):
+        if not self._is_admin(message.from_user.id):
+            await message.reply_text("Only admins can add API endpoints.")
+            return
+
+        parts = message.text.split(maxsplit=3)
+        # Direct one-shot mode if arguments supplied: /addapi <url> [api_key] [name]
+        if len(parts) >= 2 and parts[1].startswith(("http://", "https://")):
+            url = parts[1].strip()
+            api_key = parts[2].strip() if len(parts) > 2 else ""
+            name = parts[3].strip() if len(parts) > 3 else ""
+            await self._save_api_endpoint(message, url, api_key, name)
+            return
+
+        # Start interactive session
+        user_id = message.from_user.id
+        self._addapi_sessions[user_id] = {
+            "step": "awaiting_url",
+            "started_at": time.time(),
+        }
+        await message.reply_text(
+            "🌐 **Interactive API Endpoint Setup** (Step 1/3)\n\n"
+            "Please send the OpenAI-compatible API base URL.\n"
+            "*(Must include `/v1` endpoint, e.g. `https://api.openai.com/v1` or `https://my-api.com/v1`)*:\n\n"
+            "*(Type `/cancel` to cancel. Session expires after 3 minutes of inactivity)*"
+        )
+
+    async def _handle_addapi_step(self, message: Message) -> bool:
+        user_id = message.from_user.id
+        session = self._addapi_sessions.get(user_id)
+        if not session:
+            return False
+
+        now = time.time()
+        started_at = session.get("started_at", now)
+        if now - started_at > 180:
+            del self._addapi_sessions[user_id]
+            await message.reply_text(
+                "⏰ **API Setup Session Expired**\n\n"
+                "The setup session timed out due to inactivity (3 minutes limit).\n"
+                "Please type `/addapi` to start a new session."
+            )
+            return True
+
+        session["started_at"] = now
+        text = message.text.strip()
+        step = session.get("step")
+
+        if text.lower() == "/cancel":
+            del self._addapi_sessions[user_id]
+            await message.reply_text("❌ API setup session cancelled.")
+            return True
+
+        if step == "awaiting_url":
+            if not text.startswith(("http://", "https://")):
+                await message.reply_text("⚠️ Invalid URL. URL must start with `http://` or `https://`. Please try again:")
+                return True
+
+            url = text
+            if not url.endswith("/v1") and "/v1/" not in url:
+                url = url.rstrip("/") + "/v1"
+
+            session["url"] = url
+            session["step"] = "awaiting_key"
+            await message.reply_text(
+                f"URL set to: `{url}`\n\n"
+                "🔑 **API Key** (Step 2/3)\n\n"
+                "Please send the API Key for this endpoint:\n\n"
+                "*(Reply `skip` or `none` if no API key is required)*"
+            )
+            return True
+
+        elif step == "awaiting_key":
+            api_key = "" if text.lower() in ("skip", "none", "no") else text
+            session["api_key"] = api_key
+            session["step"] = "awaiting_name"
+            key_preview = "No Key" if not api_key else f"`{api_key[:4]}...`"
+            await message.reply_text(
+                f"API Key set ({key_preview}).\n\n"
+                "🏷️ **API Friendly Name** (Step 3/3)\n\n"
+                "Please send a name for this API endpoint:\n\n"
+                "*(Reply `skip` or `auto` to auto-generate a name)*"
+            )
+            return True
+
+        elif step == "awaiting_name":
+            url = session.get("url", "")
+            api_key = session.get("api_key", "")
+            del self._addapi_sessions[user_id]
+            name = "" if text.lower() in ("skip", "auto") else text
+            await self._save_api_endpoint(message, url, api_key, name)
+            return True
+
+        return False
+
+    async def _save_api_endpoint(self, message: Message, url: str, api_key: str = "", name: str = ""):
+        # Ensure /v1 endpoint
+        if not url.endswith("/v1") and "/v1/" not in url:
+            url = url.rstrip("/") + "/v1"
+
+        # Auto-name generation if name is omitted
+        if not name:
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            host = parsed.netloc.replace(":", "-").replace(".", "-").lower()
+            name = host or "custom-api"
+
+        await self.db.add_api_endpoint(name, url, api_key)
+        self.openai._models_fetched_at = None
+
+        key_info = f"`{api_key[:6]}...`" if api_key else "*None*"
+        await message.reply_text(
+            "✅ **API Endpoint Successfully Added!**\n\n"
+            f"• **Name**: `{name}`\n"
+            f"• **Base URL**: `{url}`\n"
+            f"• **API Key**: {key_info}\n\n"
+            "Discovered models are now active and listed in `/models`!"
+        )
+
+    async def _removeapi(self, client: Client, message: Message):
+        if not self._is_admin(message.from_user.id):
+            await message.reply_text("Only admins can remove API endpoints.")
+            return
+
+        parts = message.text.split(maxsplit=1)
+        if len(parts) >= 2:
+            name = parts[1].strip()
+            removed = await self.db.remove_api_endpoint(name)
+            self.openai._models_fetched_at = None
+            if removed:
+                await message.reply_text(f"✅ API endpoint `{name}` removed.")
+            else:
+                await message.reply_text(f"API endpoint `{name}` not found.")
+            return
+
+        # If no argument supplied, show interactive endpoint buttons to remove!
+        endpoints = await self.db.get_api_endpoints()
+        if not endpoints:
+            await message.reply_text(
+                "ℹ️ **No Custom API Endpoints**\n\n"
+                "There are no custom API endpoints registered to remove.\n"
+                "OpenRouter free models are active by default."
+            )
+            return
+
+        buttons = []
+        for ep in endpoints:
+            ep_name = ep.get("name", "unknown")
+            buttons.append([InlineKeyboardButton(f"🗑️ Remove {ep_name}", callback_data=f"removeapi:{ep_name}")])
+        buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="models_cancel")])
+
+        markup = InlineKeyboardMarkup(buttons)
+        await message.reply_text(
+            "🗑️ **Remove Custom API Endpoint**\n\n"
+            "Click any endpoint below to remove it, or use `/removeapi <name>`:",
+            reply_markup=markup,
+        )
+
+    async def _handle_remove_api_callback(self, client: Client, callback_query):
+        if not self._is_admin(callback_query.from_user.id):
+            await callback_query.answer("Only admins can remove API endpoints.", show_alert=True)
+            return
+
+        data = callback_query.data  # "removeapi:<name>"
+        try:
+            name = data.split(":", 1)[1].strip()
+            removed = await self.db.remove_api_endpoint(name)
+            self.openai._models_fetched_at = None
+        except Exception as e:
+            logger.error(f"Failed to remove API endpoint via callback: {e}")
+            await callback_query.answer("Failed to remove endpoint.", show_alert=True)
+            return
+
+        try:
+            await callback_query.message.delete()
+        except Exception:
+            pass
+
+        if removed:
+            await callback_query.answer(f"Removed API endpoint '{name}'", show_alert=False)
+            await client.send_message(
+                chat_id=callback_query.message.chat.id,
+                text=f"✅ API endpoint `{name}` successfully removed."
+            )
+        else:
+            await callback_query.answer(f"API endpoint '{name}' not found.", show_alert=True)
+
+    async def _list_apis(self, client: Client, message: Message):
+        if not self._is_admin(message.from_user.id):
+            await message.reply_text("Only admins can view API endpoints.")
+            return
+        endpoints = await self.db.get_api_endpoints()
+        if not endpoints:
+            await message.reply_text("No custom API endpoints registered yet. OpenRouter free models are active by default.")
+            return
+        text = "Registered Custom API Endpoints:\n\n"
+        for ep in endpoints:
+            text += f"• `{ep.get('name')}`: `{ep.get('base_url')}`\n"
+        await message.reply_text(text)
+
     async def _deny_access(self, message: Message):
         await message.reply_text(
             "You don't have access to this bot.\n"
@@ -145,14 +391,35 @@ class TelegramBot:
         self._rate_limits[user_id].append(now)
         return False
 
-    def _build_models_keyboard(self, models: list[str], current_model: str) -> InlineKeyboardMarkup:
-        """Build an inline keyboard menu for available models."""
+    def _build_models_keyboard(self, models: list[str], current_model: str, page: int = 0) -> InlineKeyboardMarkup:
+        """Build a paginated inline keyboard menu showing 9 models per page with Prev, Cancel, and Next controls."""
+        page_size = 9
+        total_models = len(models)
+        total_pages = (total_models + page_size - 1) // page_size if total_models > 0 else 1
+        page = max(0, min(page, total_pages - 1))
+
+        start_idx = page * page_size
+        end_idx = min(start_idx + page_size, total_models)
+
         buttons = []
-        for idx, m in enumerate(models):
+        for idx in range(start_idx, end_idx):
+            m = models[idx]
             is_active = (m == current_model)
             prefix = "✅ " if is_active else "🤖 "
             label = f"{prefix}{m}"
             buttons.append([InlineKeyboardButton(label, callback_data=f"setmodel:{idx}")])
+
+        # Navigation row: Prev | Cancel | Next
+        nav_row = []
+        if page > 0:
+            nav_row.append(InlineKeyboardButton("◀️ Prev", callback_data=f"models_page:{page - 1}"))
+
+        nav_row.append(InlineKeyboardButton("❌ Cancel", callback_data="models_cancel"))
+
+        if page < total_pages - 1:
+            nav_row.append(InlineKeyboardButton("Next ▶️", callback_data=f"models_page:{page + 1}"))
+
+        buttons.append(nav_row)
         return InlineKeyboardMarkup(buttons)
 
     async def _models(self, client: Client, message: Message):
@@ -163,14 +430,51 @@ class TelegramBot:
         user_id = message.from_user.id
         user_model = await self.db.get_user_model(user_id)
         current = user_model or self.openai.get_current_model()
+        total_pages = (len(models) + 8) // 9 if models else 1
 
         text = (
             "🤖 **Select Your AI Model**\n\n"
-            f"Active model: `{current}`\n\n"
-            "Click any model below to select it, or use `/model <name>`:"
+            f"Active model: `{current}`\n"
+            f"Page `1/{total_pages}` (Total: {len(models)} models)\n\n"
+            "Click any model below to select it:"
         )
-        markup = self._build_models_keyboard(models, current)
+        markup = self._build_models_keyboard(models, current, page=0)
         await message.reply_text(text, reply_markup=markup)
+
+    async def _handle_models_page_callback(self, client: Client, callback_query):
+        user_id = callback_query.from_user.id
+        if not await self._is_allowed(user_id):
+            await callback_query.answer("Access denied.", show_alert=True)
+            return
+
+        try:
+            page = int(callback_query.data.split(":", 1)[1])
+        except ValueError:
+            page = 0
+
+        models = await self.openai.get_models()
+        user_model = await self.db.get_user_model(user_id)
+        current = user_model or self.openai.get_current_model()
+        total_pages = (len(models) + 8) // 9 if models else 1
+
+        text = (
+            "🤖 **Select Your AI Model**\n\n"
+            f"Active model: `{current}`\n"
+            f"Page `{page + 1}/{total_pages}` (Total: {len(models)} models)\n\n"
+            "Click any model below to select it:"
+        )
+        markup = self._build_models_keyboard(models, current, page=page)
+        try:
+            await callback_query.edit_message_text(text, reply_markup=markup)
+        except Exception:
+            await callback_query.answer()
+
+    async def _handle_models_cancel_callback(self, client: Client, callback_query):
+        try:
+            await callback_query.message.delete()
+        except Exception as e:
+            logger.debug(f"Failed to delete models message on cancel: {e}")
+        await callback_query.answer("Cancelled model selection.")
 
     async def _model(self, client: Client, message: Message):
         if not await self._is_allowed(message.from_user.id):
@@ -228,6 +532,8 @@ class TelegramBot:
     async def _handle_message(self, client: Client, message: Message):
         if not await self._is_allowed(message.from_user.id):
             await self._deny_access(message)
+            return
+        if await self._handle_addapi_step(message):
             return
         await self._respond(message, message.text)
 
