@@ -25,7 +25,7 @@ class Config:
     mongodb_uri: str = os.getenv("MONGODB_URI", "mongodb://mongo:27017")
     mongodb_db: str = os.getenv("MONGODB_DB", "ggqtbot")
 
-    # Bot settings
+    allow_all_users: bool = os.getenv("ALLOW_ALL_USERS", "true").lower() in ("true", "1", "yes")
     admin_user_ids: list[int] = field(default_factory=list)
     group_trigger_keyword: str = os.getenv("GROUP_TRIGGER_KEYWORD", "/chat")
     max_conversation_age_minutes: int = int(

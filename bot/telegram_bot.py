@@ -58,6 +58,8 @@ class TelegramBot:
         return user_id in self.config.admin_user_ids
 
     async def _is_allowed(self, user_id: int) -> bool:
+        if self.config.allow_all_users:
+            return True
         if self._is_admin(user_id):
             return True
         return await self.db.is_allowed_user(user_id)
