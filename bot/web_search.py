@@ -13,10 +13,18 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-def clean_text_no_links(text: str) -> str:
-    """Remove any URLs or web links from text."""
+def sanitize_utf8(text: str) -> str:
+    """Sanitize text to remove invalid Unicode surrogate characters (U+D800-U+DFFF)."""
     if not text:
         return ""
+    return re.sub(r'[\uD800-\uDFFF]', '', text)
+
+
+def clean_text_no_links(text: str) -> str:
+    """Remove any URLs, web links, and invalid Unicode surrogates from text."""
+    if not text:
+        return ""
+    text = sanitize_utf8(text)
     cleaned = re.sub(r'https?://\S+|www\.\S+', '', text)
     return cleaned.strip()
 
@@ -28,6 +36,7 @@ class WebSearch:
         if not query or not query.strip():
             return []
 
+        query = sanitize_utf8(query)
         results: List[Dict[str, str]] = []
         encoded_query = urllib.parse.quote(query.strip())
         url = f"https://html.duckduckgo.com/html/?q={encoded_query}"
@@ -49,8 +58,8 @@ class WebSearch:
                             title_tag = result.find("a", class_="result__a")
                             snippet_tag = result.find("a", class_="result__snippet")
                             if title_tag and snippet_tag:
-                                title = title_tag.get_text(strip=True)
-                                snippet = snippet_tag.get_text(strip=True)
+                                title = sanitize_utf8(title_tag.get_text(strip=True))
+                                snippet = sanitize_utf8(snippet_tag.get_text(strip=True))
                                 raw_link = title_tag.get("href", "")
                                 # Extract actual destination URL if DuckDuckGo redirect link
                                 link = raw_link
@@ -58,6 +67,7 @@ class WebSearch:
                                     match = re.search(r'uddg=([^&]+)', raw_link)
                                     if match:
                                         link = urllib.parse.unquote(match.group(1))
+                                link = sanitize_utf8(link)
 
                                 if title and snippet:
                                     results.append({

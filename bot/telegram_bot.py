@@ -73,10 +73,18 @@ class TelegramBot:
         return user_id in self.config.admin_user_ids
 
     @staticmethod
+    def _sanitize_utf8(text: str) -> str:
+        """Sanitize text by removing invalid Unicode surrogate characters (U+D800-U+DFFF)."""
+        if not text:
+            return ""
+        return re.sub(r'[\uD800-\uDFFF]', '', text)
+
+    @staticmethod
     def _filter_links(text: str) -> str:
         """Format domain names with a space before extension (e.g. instagram .com) to prevent Telegram auto-hyperlinking."""
         if not text:
             return ""
+        text = re.sub(r'[\uD800-\uDFFF]', '', text)
         cleaned = re.sub(r'https?://\S+|www\.\S+|t\.me/\S+', '', text)
         cleaned = re.sub(r'\[([^\]]*)\]\(\s*\)', r'\1', cleaned)
         cleaned = re.sub(
@@ -828,13 +836,15 @@ class TelegramBot:
                     last_typing = now
                 if now - last_edit >= self.config.stream_update_interval:
                     display_text = full_response if allow_links else self._filter_links(full_response)
+                    display_text = self._sanitize_utf8(display_text)
                     if len(display_text) > 3900:
                         display_text = display_text[:3900]
                     await reply.edit_text(display_text + " ▌", parse_mode=enums.ParseMode.DISABLED)
                     last_edit = now
 
-            # Final edit (filter links if bot is not admin in group, split if exceeding Telegram limit)
+            # Final edit (sanitize UTF-8 surrogates, filter links if not admin, split if exceeding limit)
             final_text = full_response if allow_links else self._filter_links(full_response)
+            final_text = self._sanitize_utf8(final_text)
             if not final_text:
                 await reply.edit_text("(empty response)", parse_mode=enums.ParseMode.DISABLED)
             elif len(final_text) <= 4000:
