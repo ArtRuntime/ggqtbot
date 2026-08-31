@@ -671,7 +671,7 @@ class TelegramBot:
         me = await client.get_me()
         bot_username = me.username
         bot_id = me.id
-        trigger = self.config.group_trigger_keyword
+        triggers = self.config.group_trigger_keywords or [self.config.group_trigger_keyword]
 
         # Check if this is a reply to the bot's message
         is_reply_to_bot = (
@@ -680,10 +680,17 @@ class TelegramBot:
             and message.reply_to_message.from_user.id == bot_id
         )
 
-        # Respond if: trigger keyword, mentions bot, replies to bot, OR random spontaneous chance
+        # Check if message starts with any configured trigger keyword
         text_lower = message.text.lower()
+        matched_trigger = None
+        for trg in triggers:
+            if message.text.startswith(trg) or text_lower.startswith(trg.lower()):
+                matched_trigger = trg
+                break
+
+        # Respond if: any trigger keyword matched, mentions bot, replies to bot, OR random spontaneous chance
         is_triggered = (
-            message.text.startswith(trigger)
+            matched_trigger is not None
             or (bot_username and f"@{bot_username.lower()}" in text_lower)
             or is_reply_to_bot
         )
@@ -709,8 +716,8 @@ class TelegramBot:
             return
 
         text = message.text
-        if text.startswith(trigger):
-            text = text[len(trigger):].strip()
+        if matched_trigger and text.lower().startswith(matched_trigger.lower()):
+            text = text[len(matched_trigger):].strip()
         text = text.replace(f"@{bot_username}", "").strip() if bot_username else text
         if not text and not message.reply_to_message:
             return

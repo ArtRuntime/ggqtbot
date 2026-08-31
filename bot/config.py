@@ -50,6 +50,7 @@ class Config:
     allow_all_users: bool = os.getenv("ALLOW_ALL_USERS", "true").lower() in ("true", "1", "yes")
     admin_user_ids: list[int] = field(default_factory=list)
     group_trigger_keyword: str = os.getenv("GROUP_TRIGGER_KEYWORD", "/chat")
+    group_trigger_keywords: list[str] = field(default_factory=list)
     max_conversation_age_minutes: int = int(
         os.getenv("MAX_CONVERSATION_AGE_MINUTES", "180")
     )
@@ -80,3 +81,9 @@ class Config:
             self.sticker_packs = [p.strip() for p in raw_packs.split(",") if p.strip()]
         else:
             self.sticker_packs = ["Sexycatstickers"]
+
+        raw_triggers = os.getenv("GROUP_TRIGGER_KEYWORDS", os.getenv("GROUP_TRIGGER_KEYWORD", "/chat,/ai,!ask"))
+        if raw_triggers:
+            self.group_trigger_keywords = [t.strip() for t in raw_triggers.split(",") if t.strip()]
+        else:
+            self.group_trigger_keywords = ["/chat", "/ai"]
