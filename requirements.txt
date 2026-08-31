@@ -9,3 +9,4 @@ tenacity
 pydub
 httpx
 beautifulsoup4
+duckduckgo_search
