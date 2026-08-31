@@ -146,3 +146,29 @@ class Database:
         """Get all allowed users."""
         cursor = self.users.find({"allowed": True}, {"user_id": 1, "username": 1})
         return await cursor.to_list(length=100)
+
+    async def get_stats(self) -> dict:
+        """Get aggregate database statistics."""
+        try:
+            total_users = await self.users.count_documents({})
+            total_conversations = await self.conversations.count_documents({})
+            total_endpoints = await self.api_endpoints.count_documents({})
+
+            pipeline = [{"$group": {"_id": None, "total_messages": {"$sum": "$message_count"}}}]
+            agg = await self.users.aggregate(pipeline).to_list(length=1)
+            total_messages = agg[0]["total_messages"] if agg else 0
+
+            return {
+                "total_users": total_users,
+                "total_conversations": total_conversations,
+                "total_endpoints": total_endpoints,
+                "total_messages": total_messages,
+            }
+        except Exception as e:
+            logger.error(f"Failed to get stats from DB: {e}")
+            return {
+                "total_users": 0,
+                "total_conversations": 0,
+                "total_endpoints": 0,
+                "total_messages": 0,
+            }

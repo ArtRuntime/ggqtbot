@@ -2,6 +2,7 @@ import asyncio
 import logging
 import random
 import re
+import sys
 import time
 from collections import defaultdict
 from uuid import uuid4
@@ -41,6 +42,7 @@ class TelegramBot:
         self._rate_limits: dict[int, list[float]] = defaultdict(list)
         self._addapi_sessions: dict[int, dict] = {}
         self._last_random_chat: dict[int, float] = defaultdict(float)
+        self._start_time: float = time.time()
         self._register_handlers()
 
     def _register_handlers(self):
@@ -56,9 +58,10 @@ class TelegramBot:
         self.app.on_message(filters.command("removeapi"))(self._removeapi)
         self.app.on_message(filters.command("apis"))(self._list_apis)
         self.app.on_message(filters.command("search"))(self._search)
+        self.app.on_message(filters.command("stats"))(self._stats)
         self.app.on_message(filters.command("help"))(self._help)
         self.app.on_message(
-            filters.text & filters.private & ~filters.command(["start", "reset", "cancel", "model", "models", "help", "adduser", "removeuser", "users", "addapi", "removeapi", "apis", "search"])
+            filters.text & filters.private & ~filters.command(["start", "reset", "cancel", "model", "models", "help", "adduser", "removeuser", "users", "addapi", "removeapi", "apis", "search", "stats"])
         )(self._handle_message)
         self.app.on_message(filters.text & filters.group)(self._handle_group_message)
         self.app.on_message(filters.sticker)(self._handle_sticker)
@@ -146,6 +149,7 @@ class TelegramBot:
         if is_admin:
             text += (
                 "👑 **Admin Commands**\n"
+                "• `/stats` — Live system, host, database & AI status dashboard\n"
                 "• `/addapi` — Interactive wizard to add a custom OpenAI-compatible API\n"
                 "• `/removeapi` — Remove custom API endpoints via interactive buttons\n"
                 "• `/apis` — List all registered custom API endpoints\n"
@@ -441,6 +445,59 @@ class TelegramBot:
                 clean_title = self._filter_links(r['title'])
                 clean_snippet = self._filter_links(r['snippet'])
                 text += f"{idx}. **{clean_title}**\n{clean_snippet}\n\n"
+
+        await status_msg.edit_text(text)
+
+    async def _stats(self, client: Client, message: Message):
+        user_id = message.from_user.id if message.from_user else 0
+        if not self._is_admin(user_id):
+            await message.reply_text("🔒 The `/stats` dashboard is restricted to bot administrators.")
+            return
+
+        status_msg = await message.reply_text("📊 Gathering statistics...")
+
+        # Calculate Uptime
+        uptime_seconds = int(time.time() - self._start_time)
+        days, rem = divmod(uptime_seconds, 86400)
+        hours, rem = divmod(rem, 3600)
+        minutes, seconds = divmod(rem, 60)
+        uptime_str = f"{days}d {hours}h {minutes}m {seconds}s" if days else f"{hours}h {minutes}m {seconds}s"
+
+        # Calculate Memory Usage (Resident RSS)
+        mem_mb = 0.0
+        try:
+            with open("/proc/self/status", "r") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        mem_mb = float(line.split()[1]) / 1024.0
+                        break
+        except Exception:
+            pass
+
+        # Database Stats
+        db_stats = await self.db.get_stats()
+
+        # Models & Endpoints
+        models = await self.openai.get_models()
+        active_model = self.openai.get_current_model()
+
+        text = (
+            "📊 **GGQT BOT SYSTEM DASHBOARD** 🐾✨\n\n"
+            "⚙️ **System & Host**\n"
+            f"• **Uptime**: `{uptime_str}`\n"
+            f"• **RAM (RSS)**: `{mem_mb:.2f} MB`\n"
+            f"• **Python**: `{sys.version.split()[0]}`\n\n"
+            "🗄️ **Database & Engagement**\n"
+            f"• **Tracked Users**: `{db_stats['total_users']}`\n"
+            f"• **Active Chats**: `{db_stats['total_conversations']}`\n"
+            f"• **Total Messages Processed**: `{db_stats['total_messages']}`\n"
+            f"• **Custom API Endpoints**: `{db_stats['total_endpoints']}`\n\n"
+            "🤖 **AI Engine & Models**\n"
+            f"• **Active Default Model**: `{active_model}`\n"
+            f"• **Total Discovered Models**: `{len(models)}`\n"
+            f"• **OpenRouter Route**: `Active`\n\n"
+            f"💡 *Generated on {datetime.now().strftime('%b %d, %Y at %I:%M:%S %p')}*"
+        )
 
         await status_msg.edit_text(text)
 
