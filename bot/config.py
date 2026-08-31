@@ -58,6 +58,7 @@ class Config:
         os.getenv("STREAM_UPDATE_INTERVAL", "1.5")
     )
     sticker_pack: str = os.getenv("STICKER_PACK", "Sexycatstickers")
+    sticker_packs: list[str] = field(default_factory=list)
     random_group_chat_chance: float = float(
         os.getenv("RANDOM_GROUP_CHAT_CHANCE", "0.04")
     )
@@ -73,3 +74,9 @@ class Config:
             ]
         else:
             self.admin_user_ids = []
+
+        raw_packs = os.getenv("STICKER_PACKS", os.getenv("STICKER_PACK", "Sexycatstickers"))
+        if raw_packs:
+            self.sticker_packs = [p.strip() for p in raw_packs.split(",") if p.strip()]
+        else:
+            self.sticker_packs = ["Sexycatstickers"]

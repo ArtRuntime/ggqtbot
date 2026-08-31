@@ -722,7 +722,7 @@ class TelegramBot:
             await self._respond(message, text or "[replied to message]")
 
     async def _handle_sticker(self, client: Client, message: Message):
-        """Reply to stickers with a related sticker from the configured pack."""
+        """Reply to stickers with a related sticker from the configured sticker pack(s)."""
         if not message.sticker:
             return
         emoji = message.sticker.emoji
@@ -730,16 +730,28 @@ class TelegramBot:
             return
 
         try:
-            import random
-            stickers = await client.get_stickers(self.config.sticker_pack)
-            # Find stickers matching the same emoji
-            matching = [s for s in stickers if s.emoji == emoji]
+            all_stickers = []
+            packs = self.config.sticker_packs or [self.config.sticker_pack]
+            for pack in packs:
+                try:
+                    stickers = await client.get_stickers(pack)
+                    if stickers:
+                        all_stickers.extend(stickers)
+                except Exception as pack_err:
+                    logger.debug(f"Failed to fetch stickers from pack '{pack}': {pack_err}")
+
+            if not all_stickers:
+                return
+
+            # Find stickers matching the same emoji across all packs
+            matching = [s for s in all_stickers if s.emoji == emoji]
             if not matching:
-                # Fallback: pick a random sticker from the pack
-                matching = stickers
+                # Fallback: pick a random sticker from any loaded pack
+                matching = all_stickers
+
             if matching:
-                sticker = random.choice(matching)
-                await message.reply_sticker(sticker.file_id)
+                chosen_sticker = random.choice(matching)
+                await message.reply_sticker(chosen_sticker.file_id)
         except Exception as e:
             logger.error(f"Sticker handler error: {e}")
 
