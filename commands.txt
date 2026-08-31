@@ -4,9 +4,11 @@ model - View or switch AI model
 models - List available AI models
 help - Show help message
 search - Search the web for live information
-adduser - Grant user access (admin only)
-removeuser - Revoke user access (admin only)
-users - List allowed users (admin only)
+premium - View Premium status, benefits & payment details
+code - Aider-style code generation and software engineering (Premium)
+addpremium - Grant Premium tier status to a user (admin only)
+removepremium - Revoke Premium tier status from a user (admin only)
+premiums - List active Premium users (admin only)
 addapi - Add custom OpenAI API endpoint (admin only)
 removeapi - Remove custom API endpoint (admin only)
 apis - List custom API endpoints (admin only)

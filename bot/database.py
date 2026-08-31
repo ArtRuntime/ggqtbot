@@ -49,28 +49,44 @@ class Database:
         cursor = self.api_endpoints.find()
         return await cursor.to_list(length=100)
 
-    async def get_conversation(self, chat_id: int) -> list[dict]:
-        """Get conversation history for a chat."""
-        cutoff = datetime.now() - timedelta(
-            minutes=self.config.max_conversation_age_minutes
+    async def get_conversation(self, chat_id: int, is_premium: bool = False) -> list[dict]:
+        """Get conversation history for a chat with dynamic retention based on tier."""
+        max_age = (
+            self.config.premium_max_conversation_age_minutes
+            if is_premium
+            else self.config.max_conversation_age_minutes
         )
+        cutoff = datetime.now() - timedelta(minutes=max_age)
         doc = await self.conversations.find_one(
             {"chat_id": chat_id, "updated_at": {"$gte": cutoff}}
         )
         if not doc:
             return []
         messages = doc.get("messages", [])
-        return messages[-self.config.max_history_size :]
-
-    async def add_message(self, chat_id: int, role: str, content: str):
-        """Add a message to conversation history, clearing expired history if cutoff reached."""
-        cutoff = datetime.now() - timedelta(
-            minutes=self.config.max_conversation_age_minutes
+        limit = (
+            self.config.premium_max_history_size
+            if is_premium
+            else self.config.max_history_size
         )
+        return messages[-limit:]
+
+    async def add_message(self, chat_id: int, role: str, content: str, is_premium: bool = False):
+        """Add a message to conversation history with tier-aware history limits and expiration."""
+        max_age = (
+            self.config.premium_max_conversation_age_minutes
+            if is_premium
+            else self.config.max_conversation_age_minutes
+        )
+        cutoff = datetime.now() - timedelta(minutes=max_age)
         doc = await self.conversations.find_one({"chat_id": chat_id}, {"updated_at": 1})
         if doc and doc.get("updated_at") and doc["updated_at"] < cutoff:
             await self.reset_conversation(chat_id)
 
+        limit = (
+            self.config.premium_max_history_size
+            if is_premium
+            else self.config.max_history_size
+        )
         message = {"role": role, "content": content}
         await self.conversations.update_one(
             {"chat_id": chat_id},
@@ -78,7 +94,7 @@ class Database:
                 "$push": {
                     "messages": {
                         "$each": [message],
-                        "$slice": -self.config.max_history_size,
+                        "$slice": -limit,
                     }
                 },
                 "$set": {"updated_at": datetime.now()},
@@ -120,37 +136,87 @@ class Database:
             upsert=True,
         )
 
-    async def is_allowed_user(self, user_id: int) -> bool:
-        """Check if user is allowed to use the bot."""
-        doc = await self.users.find_one({"user_id": user_id}, {"allowed": 1})
-        if doc:
-            return doc.get("allowed", False)
-        return False
+    async def is_premium(self, user_id: int) -> bool:
+        """Check if user has active premium status with automatic 90-day expiration check."""
+        if user_id in self.config.admin_user_ids:
+            return True
+        doc = await self.users.find_one({"user_id": user_id}, {"is_premium": 1, "premium_until": 1})
+        if not doc or not doc.get("is_premium"):
+            return False
 
-    async def add_allowed_user(self, user_id: int):
-        """Allow a user to use the bot."""
-        await self.users.update_one(
-            {"user_id": user_id},
-            {"$set": {"allowed": True, "user_id": user_id}},
-            upsert=True,
-        )
+        # Auto-expiration check
+        premium_until = doc.get("premium_until")
+        if premium_until and datetime.now() > premium_until:
+            await self.users.update_one({"user_id": user_id}, {"$set": {"is_premium": False}})
+            return False
 
-    async def remove_allowed_user(self, user_id: int):
-        """Revoke user access."""
-        await self.users.update_one(
-            {"user_id": user_id},
-            {"$set": {"allowed": False}},
-        )
+        return True
 
-    async def get_allowed_users(self) -> list[dict]:
-        """Get all allowed users."""
-        cursor = self.users.find({"allowed": True}, {"user_id": 1, "username": 1})
-        return await cursor.to_list(length=100)
+    async def get_premium_info(self, user_id: int) -> dict | None:
+        """Get premium subscription details (remaining days, expiration) for a user."""
+        if user_id in self.config.admin_user_ids:
+            return {"is_premium": True, "is_admin": True, "remaining_days": 9999, "premium_until": None}
+        doc = await self.users.find_one({"user_id": user_id}, {"is_premium": 1, "premium_until": 1, "premium_since": 1})
+        if not doc or not doc.get("is_premium"):
+            return None
+        premium_until = doc.get("premium_until")
+        if premium_until:
+            if datetime.now() > premium_until:
+                await self.users.update_one({"user_id": user_id}, {"$set": {"is_premium": False}})
+                return None
+            remaining = (premium_until - datetime.now()).days
+            return {
+                "is_premium": True,
+                "is_admin": False,
+                "remaining_days": max(0, remaining),
+                "premium_until": premium_until,
+                "premium_since": doc.get("premium_since"),
+            }
+        return {"is_premium": True, "is_admin": False, "remaining_days": self.config.premium_duration_days, "premium_until": None}
+
+    async def set_premium(self, user_id: int, is_premium: bool, days: int = 90):
+        """Set or revoke premium tier for a user with expiration date (default 90 days)."""
+        now = datetime.now()
+        if is_premium:
+            until = now + timedelta(days=days)
+            await self.users.update_one(
+                {"user_id": user_id},
+                {
+                    "$set": {
+                        "is_premium": True,
+                        "user_id": user_id,
+                        "premium_since": now,
+                        "premium_until": until,
+                    }
+                },
+                upsert=True,
+            )
+        else:
+            await self.users.update_one(
+                {"user_id": user_id},
+                {"$set": {"is_premium": False}},
+                upsert=True,
+            )
+
+    async def get_premium_users(self) -> list[dict]:
+        """Get all active premium users, cleaning up any expired subscriptions."""
+        cursor = self.users.find({"is_premium": True}, {"user_id": 1, "username": 1, "premium_until": 1, "premium_since": 1})
+        all_prem = await cursor.to_list(length=100)
+        active = []
+        now = datetime.now()
+        for u in all_prem:
+            until = u.get("premium_until")
+            if until and now > until:
+                await self.users.update_one({"user_id": u["user_id"]}, {"$set": {"is_premium": False}})
+            else:
+                active.append(u)
+        return active
 
     async def get_stats(self) -> dict:
         """Get aggregate database statistics."""
         try:
             total_users = await self.users.count_documents({})
+            total_premium = await self.users.count_documents({"is_premium": True})
             total_conversations = await self.conversations.count_documents({})
             total_endpoints = await self.api_endpoints.count_documents({})
 
@@ -160,6 +226,7 @@ class Database:
 
             return {
                 "total_users": total_users,
+                "total_premium": total_premium,
                 "total_conversations": total_conversations,
                 "total_endpoints": total_endpoints,
                 "total_messages": total_messages,
@@ -168,6 +235,7 @@ class Database:
             logger.error(f"Failed to get stats from DB: {e}")
             return {
                 "total_users": 0,
+                "total_premium": 0,
                 "total_conversations": 0,
                 "total_endpoints": 0,
                 "total_messages": 0,

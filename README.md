@@ -7,6 +7,11 @@ A feature-rich, high-performance Telegram AI chat companion powered by **Pyrogra
 ## ✨ Features
 
 - **🐾 Natural Cat Girl Persona**: Sweet, playful, and expressive neko companion (*nya~*, cute emojis 🐾✨) that feels like a real friend.
+- **💎 2-Tier User System (Free & Premium)**:
+  - **Free Tier**: Fast chat, models switcher, web search, standard memory context.
+  - **Premium Tier**: Extended 100-message memory buffer (24h retention), dedicated Aider-style code generation (`/code`), file script uploads, and rate-limit bypass.
+- **💻 Aider-Style Code Generation (`/code`)**: Dedicated software engineering engine modeled after `aider-chat` for production-ready implementations, clean diffs, and deep code reasoning.
+- **📁 File & Code Document Uploads**: Send code files (`.py`, `.js`, `.json`, `.txt`, `.md`, `.cpp`, `.rs`, `.go`, etc.) with captions for instant AI analysis and refactoring.
 - **🌐 Live Web Search**: Integrated multi-tier DuckDuckGo web search engine (`duckduckgo-search` library + HTML & API fallbacks) providing real-time facts and latest news.
 - **⚡ Instant Startup**: Starts up in < 1 second using `openrouter/free` as immediate fallback, running model discovery concurrently in the background.
 - **🔄 Dynamic Multi-API Management**: Admins can add and remove custom OpenAI-compatible endpoints directly inside Telegram (`/addapi`, `/removeapi`, `/apis`).
@@ -24,19 +29,30 @@ A feature-rich, high-performance Telegram AI chat companion powered by **Pyrogra
 | Command | Scope | Description |
 | :--- | :--- | :--- |
 | `/start` | User | Welcome message and bot introduction |
+| `/premium` | User | View Premium tier status, benefits & payment details |
+| `/code <prompt>` | User | Aider-style code generation and software engineering (Premium) |
 | `/models` | User | Interactive 9-per-page AI model selector |
 | `/model <name>` | User | Switch active model directly |
 | `/search <query>` | User | Search the web for live information |
 | `/reset` | User | Reset current conversation session |
 | `/help` | User | Display help menu and commands |
 | `/stats` | Admin | Live system, host, database & AI status dashboard |
+| `/addpremium <id>` | Admin | Grant Premium tier status to a user |
+| `/removepremium <id>` | Admin | Revoke Premium tier status from a user |
+| `/premiums` | Admin | List all active Premium users |
 | `/addapi` | Admin | Interactive wizard to add custom API endpoints |
 | `/removeapi` | Admin | Remove custom API endpoints via interactive buttons |
 | `/apis` | Admin | List all registered custom API endpoints |
-| `/adduser <id>` | Admin | Grant access to a user (when public access is disabled) |
-| `/removeuser <id>`| Admin | Revoke access from a user |
-| `/users` | Admin | List all allowed users |
 | `/cancel` | Admin | Cancel active setup sessions |
+
+---
+
+## 💳 Premium Upgrades & Payment
+
+To upgrade an account to Premium:
+- **Payment Network**: `BNB / USDT (BEP-20)`
+- **Deposit Address**: `0x991e6f131910fa067fae85901f6c27c9c7e0673e`
+- **Activation**: Send transaction screenshot + Tx Hash to `@alex5402`.
 
 ---
 

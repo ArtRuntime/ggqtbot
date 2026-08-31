@@ -257,15 +257,55 @@ class OpenAIHelper:
 
         return (current, self.client)
 
+    @staticmethod
+    def _trim_messages_for_payload(messages: list[dict], max_chars: int = 15000) -> list[dict]:
+        """Trim conversation messages if payload exceeds model limits, keeping system prompt and latest user prompt intact."""
+        if not messages:
+            return messages
+        total_len = sum(len(m.get("content", "")) for m in messages)
+        if total_len <= max_chars:
+            return messages
+
+        # Always retain system prompt (first) and latest user prompt (last)
+        system_msg = messages[0] if messages[0].get("role") == "system" else None
+        last_msg = messages[-1]
+
+        # Truncate last_msg content if it alone exceeds max_chars
+        last_content = last_msg.get("content", "")
+        if len(last_content) > max_chars - 2000:
+            last_content = last_content[:max_chars - 2000] + "\n...[Content truncated for model context limit]"
+            last_msg = {"role": last_msg.get("role", "user"), "content": last_content}
+
+        trimmed = []
+        if system_msg:
+            trimmed.append(system_msg)
+
+        # Add most recent history from the end backwards until max_chars is reached
+        history_msgs = messages[1:-1] if system_msg else messages[:-1]
+        current_len = len(system_msg.get("content", "") if system_msg else "") + len(last_msg.get("content", ""))
+        kept_history = []
+        for msg in reversed(history_msgs):
+            m_len = len(msg.get("content", ""))
+            if current_len + m_len > max_chars:
+                break
+            kept_history.insert(0, msg)
+            current_len += m_len
+
+        trimmed.extend(kept_history)
+        trimmed.append(last_msg)
+        return trimmed
+
     async def chat_completion_stream(
         self, messages: list[dict], model: str | None = None
     ) -> AsyncGenerator[tuple[str, str], None]:
-        """Stream a chat completion response with robust primary & OpenRouter fallback handling. Yields (chunk, model_used)."""
+        """Stream a chat completion response with robust multi-model fallback and 413 Payload Too Large mitigation."""
         use_model = model or self.get_current_model()
         client_to_use = self._get_client_for_model(use_model)
+        active_messages = messages
+
         kwargs = {
             "model": use_model,
-            "messages": messages,
+            "messages": active_messages,
             "stream": True,
         }
         if self.config.openai_max_tokens:
@@ -276,35 +316,69 @@ class OpenAIHelper:
             async for chunk in stream:
                 if chunk.choices and chunk.choices[0].delta.content:
                     yield (chunk.choices[0].delta.content, use_model)
+            return
         except Exception as e:
-            logger.warning(f"Streaming failed with model '{use_model}' ({e}). Searching for primary or OpenRouter fallback model...")
-            fallback_model, fallback_client = await self.get_working_fallback_model(exclude_models={use_model})
-            if fallback_model != use_model or fallback_client != client_to_use:
-                logger.info(f"Retrying stream with verified fallback model '{fallback_model}'...")
-                fallback_kwargs = {
-                    "model": fallback_model,
-                    "messages": messages,
-                    "stream": True,
-                }
-                if self.config.openai_max_tokens:
-                    fallback_kwargs["max_tokens"] = self.config.openai_max_tokens
-                stream = await fallback_client.chat.completions.create(**fallback_kwargs)
-                async for chunk in stream:
-                    if chunk.choices and chunk.choices[0].delta.content:
-                        yield (chunk.choices[0].delta.content, fallback_model)
-            else:
-                raise e
+            err_str = str(e).lower()
+            logger.warning(f"Streaming failed with model '{use_model}' ({e}). Initiating fallback sequence...")
+
+            # If payload was too large (HTTP 413 / request_too_large), adaptively trim payload
+            if "413" in err_str or "too large" in err_str or "payload" in err_str or "context" in err_str:
+                active_messages = self._trim_messages_for_payload(messages, max_chars=14000)
+
+            excluded: set[str] = {use_model}
+            # Fallback candidates with high context windows
+            candidates = [
+                "google/gemini-2.0-flash-exp:free",
+                "meta-llama/llama-3.3-70b-instruct:free",
+                "openrouter/free",
+                "qwen/qwen-2.5-coder-32b-instruct:free",
+                "mistralai/mistral-7b-instruct:free",
+            ]
+
+            # Try discovered models and top fallback candidates
+            available = await self.get_models()
+            for cand in candidates + available:
+                if cand in excluded:
+                    continue
+                excluded.add(cand)
+                fb_client = self._get_client_for_model(cand)
+                try:
+                    logger.info(f"Attempting fallback stream with model '{cand}'...")
+                    fb_kwargs = {
+                        "model": cand,
+                        "messages": active_messages,
+                        "stream": True,
+                    }
+                    if self.config.openai_max_tokens:
+                        fb_kwargs["max_tokens"] = self.config.openai_max_tokens
+                    stream = await fb_client.chat.completions.create(**fb_kwargs)
+                    streamed_any = False
+                    async for chunk in stream:
+                        if chunk.choices and chunk.choices[0].delta.content:
+                            streamed_any = True
+                            yield (chunk.choices[0].delta.content, cand)
+                    if streamed_any:
+                        self._default_working_model = cand
+                        return
+                except Exception as fb_err:
+                    logger.warning(f"Fallback candidate '{cand}' failed: {fb_err}")
+                    continue
+
+            # If all streaming candidates failed, raise original error
+            raise e
 
     async def chat_completion(
         self, messages: list[dict], max_tokens: int | None = None, model: str | None = None
     ) -> str:
-        """Get a full chat completion response with robust primary & OpenRouter fallback handling."""
+        """Get a full chat completion response with robust multi-model fallback and 413 Payload Too Large mitigation."""
         use_model = model or self.get_current_model()
         client_to_use = self._get_client_for_model(use_model)
         tokens = max_tokens or self.config.openai_max_tokens
+        active_messages = messages
+
         kwargs = {
             "model": use_model,
-            "messages": messages,
+            "messages": active_messages,
         }
         if tokens:
             kwargs["max_tokens"] = tokens
@@ -313,18 +387,44 @@ class OpenAIHelper:
             response = await client_to_use.chat.completions.create(**kwargs)
             return response.choices[0].message.content or ""
         except Exception as e:
-            logger.warning(f"Model '{use_model}' failed ({e}). Searching for primary or OpenRouter fallback model...")
-            fallback_model, fallback_client = await self.get_working_fallback_model(exclude_models={use_model})
-            if fallback_model != use_model or fallback_client != client_to_use:
-                logger.info(f"Retrying completion with verified fallback model '{fallback_model}'...")
-                fallback_kwargs = {
-                    "model": fallback_model,
-                    "messages": messages,
-                }
-                if tokens:
-                    fallback_kwargs["max_tokens"] = tokens
-                response = await fallback_client.chat.completions.create(**fallback_kwargs)
-                return response.choices[0].message.content or ""
+            err_str = str(e).lower()
+            logger.warning(f"Model '{use_model}' failed ({e}). Initiating fallback sequence...")
+
+            if "413" in err_str or "too large" in err_str or "payload" in err_str or "context" in err_str:
+                active_messages = self._trim_messages_for_payload(messages, max_chars=14000)
+
+            excluded: set[str] = {use_model}
+            candidates = [
+                "google/gemini-2.0-flash-exp:free",
+                "meta-llama/llama-3.3-70b-instruct:free",
+                "openrouter/free",
+                "qwen/qwen-2.5-coder-32b-instruct:free",
+                "mistralai/mistral-7b-instruct:free",
+            ]
+
+            available = await self.get_models()
+            for cand in candidates + available:
+                if cand in excluded:
+                    continue
+                excluded.add(cand)
+                fb_client = self._get_client_for_model(cand)
+                try:
+                    logger.info(f"Attempting fallback completion with model '{cand}'...")
+                    fb_kwargs = {
+                        "model": cand,
+                        "messages": active_messages,
+                    }
+                    if tokens:
+                        fb_kwargs["max_tokens"] = tokens
+                    response = await fb_client.chat.completions.create(**fb_kwargs)
+                    content = response.choices[0].message.content or ""
+                    if content:
+                        self._default_working_model = cand
+                        return content
+                except Exception as fb_err:
+                    logger.warning(f"Fallback candidate '{cand}' failed: {fb_err}")
+                    continue
+
             raise e
 
     def openrouter_sdk_completion(self, messages: list[dict], model: str | None = None) -> str:
