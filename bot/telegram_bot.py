@@ -49,6 +49,7 @@ class TelegramBot:
         self.inline_queries_cache: dict[str, str] = {}
         self._rate_limits: dict[int, list[float]] = defaultdict(list)
         self._addapi_sessions: dict[int, dict] = {}
+        self._addfallback_sessions: dict[int, dict] = {}
         self._last_random_chat: dict[int, float] = defaultdict(float)
         self._start_time: float = time.time()
         self._register_handlers()
@@ -62,6 +63,9 @@ class TelegramBot:
         self.app.on_message(filters.command("addapi"))(self._addapi)
         self.app.on_message(filters.command("removeapi"))(self._removeapi)
         self.app.on_message(filters.command("apis"))(self._list_apis)
+        self.app.on_message(filters.command("addfallback"))(self._addfallback)
+        self.app.on_message(filters.command("removefallback"))(self._removefallback)
+        self.app.on_message(filters.command("fallbacks"))(self._list_fallbacks)
         self.app.on_message(filters.command("search"))(self._search)
         self.app.on_message(filters.command("stats"))(self._stats)
         self.app.on_message(filters.command("premium"))(self._premium)
@@ -71,7 +75,7 @@ class TelegramBot:
         self.app.on_message(filters.command("premiums"))(self._list_premiums)
         self.app.on_message(filters.command("help"))(self._help)
         self.app.on_message(
-            filters.text & filters.private & ~filters.command(["start", "reset", "cancel", "model", "models", "help", "addapi", "removeapi", "apis", "search", "stats", "premium", "code", "addpremium", "removepremium", "premiums"])
+            filters.text & filters.private & ~filters.command(["start", "reset", "cancel", "model", "models", "help", "addapi", "removeapi", "apis", "addfallback", "removefallback", "fallbacks", "search", "stats", "premium", "code", "addpremium", "removepremium", "premiums"])
         )(self._handle_message)
         self.app.on_message(filters.text & filters.group)(self._handle_group_message)
         self.app.on_message(filters.document & filters.private)(self._handle_document)
@@ -83,6 +87,7 @@ class TelegramBot:
         self.app.on_callback_query(filters.regex(r"^models_cancel$"))(self._handle_models_cancel_callback)
         self.app.on_callback_query(filters.regex(r"^setmodel:"))(self._handle_set_model_callback)
         self.app.on_callback_query(filters.regex(r"^removeapi:"))(self._handle_remove_api_callback)
+        self.app.on_callback_query(filters.regex(r"^removefallback:"))(self._handle_remove_fallback_callback)
 
     def _is_admin(self, user_id: int) -> bool:
         return user_id in self.config.admin_user_ids
@@ -170,6 +175,9 @@ class TelegramBot:
                 "• `/addapi` — Interactive wizard to add a custom OpenAI-compatible API\n"
                 "• `/removeapi` — Remove custom API endpoints via interactive buttons\n"
                 "• `/apis` — List all registered custom API endpoints\n"
+                "• `/addfallback` — Interactive wizard to add a custom fallback model (URL -> Key -> Model ID)\n"
+                "• `/removefallback` — Remove fallback models via interactive buttons\n"
+                "• `/fallbacks` — View active fallback chain in priority order\n"
                 "• `/cancel` — Cancel an active setup session\n\n"
             )
 
@@ -233,9 +241,16 @@ class TelegramBot:
 
     async def _cancel_session(self, client: Client, message: Message):
         user_id = message.from_user.id
+        cancelled = False
         if user_id in self._addapi_sessions:
             del self._addapi_sessions[user_id]
-            await message.reply_text("❌ API setup session cancelled.")
+            cancelled = True
+        if user_id in self._addfallback_sessions:
+            del self._addfallback_sessions[user_id]
+            cancelled = True
+
+        if cancelled:
+            await message.reply_text("❌ Setup session cancelled.")
         else:
             await message.reply_text("No active setup session to cancel.")
 
@@ -437,6 +452,205 @@ class TelegramBot:
         text = "Registered Custom API Endpoints:\n\n"
         for ep in endpoints:
             text += f"• `{ep.get('name')}`: `{ep.get('base_url')}`\n"
+        await message.reply_text(text)
+
+    async def _addfallback(self, client: Client, message: Message):
+        if not self._is_admin(message.from_user.id):
+            await message.reply_text("Only admins can add fallback models.")
+            return
+
+        parts = message.text.split(maxsplit=3)
+        # Usage 1: Direct one-shot mode: /addfallback <base_url> <api_key> <model_id>
+        if len(parts) >= 4:
+            url, api_key, model_id = parts[1].strip(), parts[2].strip(), parts[3].strip()
+            api_key = "" if api_key.lower() in ("none", "skip", "no", "-") else api_key
+            await self._save_fallback_model(message, url, api_key, model_id)
+            return
+
+        # Usage 2: Interactive multi-step setup
+        user_id = message.from_user.id
+        self._addfallback_sessions[user_id] = {
+            "step": "awaiting_url",
+            "started_at": time.time(),
+        }
+
+        await message.reply_text(
+            "🛡️ **Add Fallback Model** (Step 1/3)\n\n"
+            "Please send the **API Base URL** for this fallback model\n"
+            "(e.g., `https://api.groq.com/openai/v1` or `https://openrouter.ai/api/v1`):\n\n"
+            "*(Reply `/cancel` to abort)*"
+        )
+
+    async def _handle_addfallback_step(self, message: Message) -> bool:
+        if not message.text or not message.from_user:
+            return False
+        user_id = message.from_user.id
+        session = self._addfallback_sessions.get(user_id)
+        if not session:
+            return False
+
+        now = time.time()
+        started_at = session.get("started_at", now)
+        if now - started_at > 180:
+            del self._addfallback_sessions[user_id]
+            await message.reply_text(
+                "⏰ **Fallback Setup Session Expired**\n\n"
+                "The setup session timed out due to inactivity (3 minutes limit).\n"
+                "Please type `/addfallback` to start again."
+            )
+            return True
+
+        session["started_at"] = now
+        text = message.text.strip()
+        step = session.get("step")
+
+        if text.lower() == "/cancel":
+            del self._addfallback_sessions[user_id]
+            await message.reply_text("❌ Fallback setup session cancelled.")
+            return True
+
+        if step == "awaiting_url":
+            if not text.startswith(("http://", "https://")):
+                await message.reply_text("⚠️ Invalid URL. URL must start with `http://` or `https://`. Please try again:")
+                return True
+
+            url = text
+            if not url.endswith("/v1") and "/v1/" not in url and not url.endswith("/v1beta"):
+                url = url.rstrip("/") + "/v1"
+
+            session["url"] = url
+            session["step"] = "awaiting_key"
+            await message.reply_text(
+                f"URL set to: `{url}`\n\n"
+                "🔑 **API Key** (Step 2/3)\n\n"
+                "Please send the **API Key** for this fallback endpoint:\n\n"
+                "*(Reply `skip` or `none` if no API key is required)*"
+            )
+            return True
+
+        elif step == "awaiting_key":
+            api_key = "" if text.lower() in ("skip", "none", "no") else text
+            session["api_key"] = api_key
+            session["step"] = "awaiting_model"
+            key_preview = "No Key" if not api_key else f"`{api_key[:4]}...`"
+            await message.reply_text(
+                f"API Key set ({key_preview}).\n\n"
+                "🤖 **Model ID** (Step 3/3)\n\n"
+                "Please send the **Model ID** (e.g. `llama-3.3-70b-versatile`, `deepseek/deepseek-chat`, `gpt-4o-mini`):"
+            )
+            return True
+
+        elif step == "awaiting_model":
+            url = session.get("url", "")
+            api_key = session.get("api_key", "")
+            del self._addfallback_sessions[user_id]
+            model_id = text
+            await self._save_fallback_model(message, url, api_key, model_id)
+            return True
+
+        return False
+
+    async def _save_fallback_model(self, message: Message, url: str, api_key: str, model_id: str):
+        if not url.endswith("/v1") and "/v1/" not in url and not url.endswith("/v1beta"):
+            url = url.rstrip("/") + "/v1"
+
+        await self.db.add_fallback_model(base_url=url, api_key=api_key, model_name=model_id)
+
+        key_info = f"`{api_key[:6]}...`" if api_key else "*None*"
+        await message.reply_text(
+            "✅ **Fallback Model Successfully Added!**\n\n"
+            f"• **Model ID**: `{model_id}`\n"
+            f"• **Base URL**: `{url}`\n"
+            f"• **API Key**: {key_info}\n\n"
+            "This model will now be attempted automatically whenever primary models fail, before `openrouter/free`!"
+        )
+
+    async def _removefallback(self, client: Client, message: Message):
+        if not self._is_admin(message.from_user.id):
+            await message.reply_text("Only admins can remove fallback models.")
+            return
+
+        parts = message.text.split(maxsplit=1)
+        if len(parts) >= 2:
+            model_id = parts[1].strip()
+            removed = await self.db.remove_fallback_model(model_id)
+            if removed:
+                await message.reply_text(f"✅ Fallback model `{model_id}` removed.")
+            else:
+                await message.reply_text(f"Fallback model `{model_id}` not found.")
+            return
+
+        fallbacks = await self.db.get_fallback_models()
+        if not fallbacks:
+            await message.reply_text(
+                "ℹ️ **No Custom Fallback Models**\n\n"
+                "There are no custom fallback models configured.\n"
+                f"Default fallback is `{self.config.openrouter_default_model}`."
+            )
+            return
+
+        buttons = []
+        for fb in fallbacks:
+            m_name = fb.get("model_name", "unknown")
+            buttons.append([InlineKeyboardButton(f"🗑️ Remove {m_name}", callback_data=f"removefallback:{m_name}")])
+        buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="models_cancel")])
+
+        markup = InlineKeyboardMarkup(buttons)
+        await message.reply_text(
+            "🗑️ **Remove Fallback Model**\n\n"
+            "Click any fallback model below to remove it, or use `/removefallback <model_id>`:",
+            reply_markup=markup,
+        )
+
+    async def _handle_remove_fallback_callback(self, client: Client, callback_query):
+        if not self._is_admin(callback_query.from_user.id):
+            await callback_query.answer("Only admins can remove fallback models.", show_alert=True)
+            return
+
+        data = callback_query.data
+        try:
+            model_id = data.split(":", 1)[1].strip()
+            removed = await self.db.remove_fallback_model(model_id)
+        except Exception as e:
+            logger.error(f"Failed to remove fallback callback: {e}")
+            await callback_query.answer("Failed to remove fallback model.", show_alert=True)
+            return
+
+        try:
+            await callback_query.message.delete()
+        except Exception:
+            pass
+
+        if removed:
+            await callback_query.answer(f"Removed fallback model '{model_id}'", show_alert=False)
+            await client.send_message(
+                chat_id=callback_query.message.chat.id,
+                text=f"✅ Fallback model `{model_id}` successfully removed."
+            )
+        else:
+            await callback_query.answer(f"Fallback model '{model_id}' not found.", show_alert=True)
+
+    async def _list_fallbacks(self, client: Client, message: Message):
+        if not self._is_admin(message.from_user.id):
+            await message.reply_text("Only admins can view fallback models.")
+            return
+
+        fallbacks = await self.db.get_fallback_models()
+        text = "🛡️ **Active Fallback Models Chain (In Priority Order):**\n\n"
+        if fallbacks:
+            for idx, fb in enumerate(fallbacks, 1):
+                m_name = fb.get("model_name")
+                b_url = fb.get("base_url")
+                has_key = "🔑 Yes" if fb.get("api_key") else "🔓 None"
+                text += f"**{idx}.** `{m_name}`\n   • Endpoint: `{b_url}`\n   • Key: {has_key}\n\n"
+        else:
+            text += "*No custom fallback models registered yet. Use `/addfallback` to add one.*\n\n"
+
+        text += (
+            f"**Ultimate Fallback (Last Resort):**\n"
+            f"• `{self.config.openrouter_default_model}` (OpenRouter Free Tier)\n\n"
+            "Commands: `/addfallback`, `/removefallback`, `/fallbacks`"
+        )
         await message.reply_text(text)
 
     async def _search(self, client: Client, message: Message):
@@ -935,6 +1149,8 @@ class TelegramBot:
             await self._deny_access(message)
             return
         if await self._handle_addapi_step(message):
+            return
+        if await self._handle_addfallback_step(message):
             return
         await self._respond(message, message.text)
 

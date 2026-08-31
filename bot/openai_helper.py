@@ -295,6 +295,52 @@ class OpenAIHelper:
         trimmed.append(last_msg)
         return trimmed
 
+    async def _get_fallback_pipeline(self) -> list[tuple[AsyncOpenAI, str]]:
+        """Get ordered list of (client, model_name) fallbacks: Custom DB models first, then OpenRouter candidates, and lastly OPENROUTER_DEFAULT_MODEL."""
+        pipeline: list[tuple[AsyncOpenAI, str]] = []
+        seen: set[tuple[str, str]] = set()
+
+        # 1. Custom fallback models from database (Highest priority fallback before openrouter/free)
+        if self.db and hasattr(self.db, "get_fallback_models"):
+            try:
+                db_fallbacks = await self.db.get_fallback_models()
+                for fb in db_fallbacks:
+                    base_url = fb.get("base_url")
+                    api_key = fb.get("api_key") or ""
+                    model_name = fb.get("model_name")
+                    if base_url and model_name:
+                        key = (base_url, model_name)
+                        if key not in seen:
+                            seen.add(key)
+                            client = AsyncOpenAI(api_key=api_key or "placeholder", base_url=base_url)
+                            pipeline.append((client, model_name))
+            except Exception as e:
+                logger.warning(f"Failed to fetch DB fallback models: {e}")
+
+        # 2. OpenRouter free high-context candidates
+        if self.openrouter_client:
+            openrouter_cands = [
+                "google/gemini-2.0-flash-exp:free",
+                "meta-llama/llama-3.3-70b-instruct:free",
+                "qwen/qwen-2.5-coder-32b-instruct:free",
+                "mistralai/mistral-7b-instruct:free",
+            ]
+            for om in openrouter_cands:
+                key = (self.config.openrouter_base_url, om)
+                if key not in seen:
+                    seen.add(key)
+                    pipeline.append((self.openrouter_client, om))
+
+        # 3. Ultimate Fallback: OPENROUTER_DEFAULT_MODEL (e.g. openrouter/free)
+        default_fb_model = self.config.openrouter_default_model or "openrouter/free"
+        if self.openrouter_client:
+            key = (self.config.openrouter_base_url, default_fb_model)
+            if key not in seen:
+                seen.add(key)
+                pipeline.append((self.openrouter_client, default_fb_model))
+
+        return pipeline
+
     async def chat_completion_stream(
         self, messages: list[dict], model: str | None = None
     ) -> AsyncGenerator[tuple[str, str], None]:
@@ -325,23 +371,10 @@ class OpenAIHelper:
             if "413" in err_str or "too large" in err_str or "payload" in err_str or "context" in err_str:
                 active_messages = self._trim_messages_for_payload(messages, max_chars=14000)
 
-            excluded: set[str] = {use_model}
-            # Fallback candidates with high context windows
-            candidates = [
-                "google/gemini-2.0-flash-exp:free",
-                "meta-llama/llama-3.3-70b-instruct:free",
-                "openrouter/free",
-                "qwen/qwen-2.5-coder-32b-instruct:free",
-                "mistralai/mistral-7b-instruct:free",
-            ]
-
-            # Try discovered models and top fallback candidates
-            available = await self.get_models()
-            for cand in candidates + available:
-                if cand in excluded:
+            pipeline = await self._get_fallback_pipeline()
+            for fb_client, cand in pipeline:
+                if cand == use_model:
                     continue
-                excluded.add(cand)
-                fb_client = self._get_client_for_model(cand)
                 try:
                     logger.info(f"Attempting fallback stream with model '{cand}'...")
                     fb_kwargs = {
@@ -393,21 +426,10 @@ class OpenAIHelper:
             if "413" in err_str or "too large" in err_str or "payload" in err_str or "context" in err_str:
                 active_messages = self._trim_messages_for_payload(messages, max_chars=14000)
 
-            excluded: set[str] = {use_model}
-            candidates = [
-                "google/gemini-2.0-flash-exp:free",
-                "meta-llama/llama-3.3-70b-instruct:free",
-                "openrouter/free",
-                "qwen/qwen-2.5-coder-32b-instruct:free",
-                "mistralai/mistral-7b-instruct:free",
-            ]
-
-            available = await self.get_models()
-            for cand in candidates + available:
-                if cand in excluded:
+            pipeline = await self._get_fallback_pipeline()
+            for fb_client, cand in pipeline:
+                if cand == use_model:
                     continue
-                excluded.add(cand)
-                fb_client = self._get_client_for_model(cand)
                 try:
                     logger.info(f"Attempting fallback completion with model '{cand}'...")
                     fb_kwargs = {

@@ -16,6 +16,7 @@ class Database:
         self.conversations = self.db["conversations"]
         self.users = self.db["users"]
         self.api_endpoints = self.db["api_endpoints"]
+        self.fallback_models = self.db["fallback_models"]
 
     async def init(self):
         """Create indexes."""
@@ -23,6 +24,41 @@ class Database:
         await self.conversations.create_index("updated_at")
         await self.users.create_index("user_id", unique=True)
         await self.api_endpoints.create_index("name", unique=True)
+        await self.fallback_models.create_index([("model_name", 1), ("base_url", 1)], unique=True)
+
+    async def add_fallback_model(self, base_url: str, api_key: str, model_name: str, name: str = "") -> dict:
+        """Add or update a fallback model in the fallback chain."""
+        if not base_url.endswith("/v1") and "/v1/" not in base_url and not base_url.endswith("/v1beta"):
+            base_url = base_url.rstrip("/") + "/v1"
+
+        if not name:
+            name = model_name
+
+        data = {
+            "name": name,
+            "base_url": base_url,
+            "api_key": api_key,
+            "model_name": model_name,
+            "updated_at": datetime.now(),
+        }
+        await self.fallback_models.update_one(
+            {"model_name": model_name, "base_url": base_url},
+            {"$set": data, "$setOnInsert": {"created_at": datetime.now()}},
+            upsert=True,
+        )
+        return data
+
+    async def remove_fallback_model(self, identifier: str) -> bool:
+        """Remove a fallback model by model_name or name."""
+        res = await self.fallback_models.delete_many(
+            {"$or": [{"model_name": identifier}, {"name": identifier}]}
+        )
+        return res.deleted_count > 0
+
+    async def get_fallback_models(self) -> list[dict]:
+        """Get all custom fallback models ordered by creation time."""
+        cursor = self.fallback_models.find().sort("created_at", 1)
+        return await cursor.to_list(length=100)
 
     async def add_api_endpoint(self, name: str, base_url: str, api_key: str = ""):
         """Add or update a custom OpenAI-compatible API endpoint."""
