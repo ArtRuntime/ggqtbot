@@ -4,6 +4,7 @@ import logging
 import os
 import random
 import re
+import shutil
 import signal
 import sys
 import tempfile
@@ -288,11 +289,28 @@ class TelegramBot:
         self.config = config
         self.openai = openai
         self.db = db
+        # Ensure persistent session directory exists (for Docker volume mounting ./data:/app/data)
+        session_dir = Path(os.getenv("SESSION_DIR", "data"))
+        session_dir.mkdir(parents=True, exist_ok=True)
+
+        # Automatic migration: if root ggqtbot.session exists, migrate to data/ggqtbot.session
+        root_sess = Path("ggqtbot.session")
+        data_sess = session_dir / "ggqtbot.session"
+        if root_sess.is_file() and not data_sess.is_file():
+            try:
+                shutil.copy2(root_sess, data_sess)
+                root_journal = Path("ggqtbot.session-journal")
+                if root_journal.is_file():
+                    shutil.copy2(root_journal, session_dir / "ggqtbot.session-journal")
+            except Exception as mig_err:
+                logger.debug(f"Session migration notice: {mig_err}")
+
         self.app = Client(
             "ggqtbot",
             api_id=config.api_id,
             api_hash=config.api_hash,
             bot_token=config.bot_token,
+            workdir=str(session_dir),
         )
         self.inline_queries_cache: dict[str, dict] = {}
         self._rate_limits: dict[int, list[float]] = defaultdict(list)
