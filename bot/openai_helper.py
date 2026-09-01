@@ -297,10 +297,18 @@ class OpenAIHelper:
         system_msg = messages[0] if messages[0].get("role") == "system" else None
         last_msg = messages[-1]
 
+        # Truncate system_msg content if it alone exceeds safe threshold
+        if system_msg:
+            sys_content = system_msg.get("content", "")
+            if len(sys_content) > max_chars // 2:
+                sys_content = sys_content[:max_chars // 2] + "\n...[System prompt truncated for model context limit]"
+                system_msg = {"role": "system", "content": sys_content}
+
         # Truncate last_msg content if it alone exceeds max_chars
         last_content = last_msg.get("content", "")
-        if len(last_content) > max_chars - 2000:
-            last_content = last_content[:max_chars - 2000] + "\n...[Content truncated for model context limit]"
+        max_user_chars = max_chars - len(system_msg.get("content", "") if system_msg else "") - 1000
+        if len(last_content) > max_user_chars:
+            last_content = last_content[:max_user_chars] + "\n...[Content truncated for model context limit]"
             last_msg = {"role": last_msg.get("role", "user"), "content": last_content}
 
         trimmed = []
