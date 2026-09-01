@@ -7,6 +7,9 @@ venv/
 /.openclaude
 .openclaude/*
 cache/
+./temp
+/temp
+/temp/*
 downloads/
 __pycache__/
 bot/cookies/*

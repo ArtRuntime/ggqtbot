@@ -23,6 +23,7 @@ class Database:
         await self.conversations.create_index("chat_id")
         await self.conversations.create_index("updated_at")
         await self.users.create_index("user_id", unique=True)
+        await self.users.create_index("premium_until")
         await self.api_endpoints.create_index("name", unique=True)
         await self.fallback_models.create_index([("model_name", 1), ("base_url", 1)], unique=True)
 
@@ -142,8 +143,8 @@ class Database:
         """Reset conversation history for a chat."""
         await self.conversations.delete_one({"chat_id": chat_id})
 
-    async def track_user(self, user_id: int, username: str | None):
-        """Track user info."""
+    async def track_user(self, user_id: int, username: str | None = None):
+        """Track user info and ensure new users default to Free (is_premium: False)."""
         await self.users.update_one(
             {"user_id": user_id},
             {
@@ -151,6 +152,10 @@ class Database:
                     "user_id": user_id,
                     "username": username,
                     "last_seen": datetime.now(),
+                },
+                "$setOnInsert": {
+                    "is_premium": False,
+                    "created_at": datetime.now(),
                 },
                 "$inc": {"message_count": 1},
             },
@@ -174,15 +179,21 @@ class Database:
 
     async def is_premium(self, user_id: int) -> bool:
         """Check if user has active premium status with automatic 90-day expiration check."""
+        if not user_id:
+            return False
         if user_id in self.config.admin_user_ids:
             return True
         doc = await self.users.find_one({"user_id": user_id}, {"is_premium": 1, "premium_until": 1})
         if not doc or not doc.get("is_premium"):
             return False
 
-        # Auto-expiration check
+        # If user is marked premium, verify expiration date
         premium_until = doc.get("premium_until")
-        if premium_until and datetime.now() > premium_until:
+        if not premium_until:
+            await self.users.update_one({"user_id": user_id}, {"$set": {"is_premium": False}})
+            return False
+
+        if datetime.now() > premium_until:
             await self.users.update_one({"user_id": user_id}, {"$set": {"is_premium": False}})
             return False
 
@@ -190,25 +201,28 @@ class Database:
 
     async def get_premium_info(self, user_id: int) -> dict | None:
         """Get premium subscription details (remaining days, expiration) for a user."""
+        if not user_id:
+            return None
         if user_id in self.config.admin_user_ids:
             return {"is_premium": True, "is_admin": True, "remaining_days": 9999, "premium_until": None}
         doc = await self.users.find_one({"user_id": user_id}, {"is_premium": 1, "premium_until": 1, "premium_since": 1})
         if not doc or not doc.get("is_premium"):
             return None
         premium_until = doc.get("premium_until")
-        if premium_until:
-            if datetime.now() > premium_until:
-                await self.users.update_one({"user_id": user_id}, {"$set": {"is_premium": False}})
-                return None
-            remaining = (premium_until - datetime.now()).days
-            return {
-                "is_premium": True,
-                "is_admin": False,
-                "remaining_days": max(0, remaining),
-                "premium_until": premium_until,
-                "premium_since": doc.get("premium_since"),
-            }
-        return {"is_premium": True, "is_admin": False, "remaining_days": self.config.premium_duration_days, "premium_until": None}
+        if not premium_until:
+            await self.users.update_one({"user_id": user_id}, {"$set": {"is_premium": False}})
+            return None
+        if datetime.now() > premium_until:
+            await self.users.update_one({"user_id": user_id}, {"$set": {"is_premium": False}})
+            return None
+        remaining = (premium_until - datetime.now()).days
+        return {
+            "is_premium": True,
+            "is_admin": False,
+            "remaining_days": max(0, remaining),
+            "premium_until": premium_until,
+            "premium_since": doc.get("premium_since"),
+        }
 
     async def set_premium(self, user_id: int, is_premium: bool, days: int = 90):
         """Set or revoke premium tier for a user with expiration date (default 90 days)."""
@@ -223,7 +237,12 @@ class Database:
                         "user_id": user_id,
                         "premium_since": now,
                         "premium_until": until,
-                    }
+                    },
+                    "$unset": {
+                        "notified_expiring_3d": "",
+                        "notified_expiring_1d": "",
+                        "notified_expired": "",
+                    },
                 },
                 upsert=True,
             )
@@ -234,19 +253,41 @@ class Database:
                 upsert=True,
             )
 
+    async def get_all_active_premium_candidates(self) -> list[dict]:
+        """Get all active non-admin premium users for expiration monitoring and notifications."""
+        cursor = self.users.find(
+            {
+                "is_premium": True,
+                "user_id": {"$nin": self.config.admin_user_ids},
+            }
+        )
+        return await cursor.to_list(length=500)
+
     async def get_premium_users(self) -> list[dict]:
         """Get all active premium users, cleaning up any expired subscriptions."""
+        await self.cleanup_expired_premium_users()
         cursor = self.users.find({"is_premium": True}, {"user_id": 1, "username": 1, "premium_until": 1, "premium_since": 1})
-        all_prem = await cursor.to_list(length=100)
-        active = []
+        return await cursor.to_list(length=100)
+
+    async def cleanup_expired_premium_users(self) -> int:
+        """Batch cleanup of all expired premium subscriptions (auto-revert to non-premium)."""
         now = datetime.now()
-        for u in all_prem:
-            until = u.get("premium_until")
-            if until and now > until:
-                await self.users.update_one({"user_id": u["user_id"]}, {"$set": {"is_premium": False}})
-            else:
-                active.append(u)
-        return active
+        # Clean up any non-admin users where premium_until is missing or expired
+        res = await self.users.update_many(
+            {
+                "is_premium": True,
+                "user_id": {"$nin": self.config.admin_user_ids},
+                "$or": [
+                    {"premium_until": {"$lte": now}},
+                    {"premium_until": {"$exists": False}},
+                    {"premium_until": None},
+                ],
+            },
+            {"$set": {"is_premium": False}},
+        )
+        if res.modified_count > 0:
+            logger.info(f"Auto-expired and reverted {res.modified_count} premium subscriptions back to Free status.")
+        return res.modified_count
 
     async def get_stats(self) -> dict:
         """Get aggregate database statistics."""

@@ -66,10 +66,10 @@ class Config:
     premium_max_conversation_age_minutes: int = int(
         os.getenv("PREMIUM_MAX_CONVERSATION_AGE_MINUTES", "1440")
     )
-    payment_address: str = "0x991e6f131910fa067fae85901f6c27c9c7e0673e"
-    payment_network: str = "BNB / USDT (BEP-20)"
-    admin_contact: str = "@alex5402"
-    premium_price: str = "$8"
+    payment_address: str = os.getenv("PAYMENT_ADDRESS", "0x991e6f131910fa067fae85901f6c27c9c7e0673e")
+    payment_network: str = os.getenv("PAYMENT_NETWORK", "BNB / USDT (BEP-20)")
+    admin_contact: str = os.getenv("ADMIN_CONTACT", "@alex5402")
+    premium_price: str = os.getenv("PREMIUM_PRICE", "$8")
     premium_duration_days: int = 90
 
     sticker_pack: str = os.getenv("STICKER_PACK", "Sexycatstickers")

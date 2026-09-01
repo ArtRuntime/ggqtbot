@@ -5,7 +5,6 @@ from typing import Any, AsyncGenerator
 
 import httpx
 from openai import AsyncOpenAI
-from tenacity import retry, stop_after_attempt, wait_exponential
 
 from bot.config import Config
 
@@ -39,6 +38,7 @@ class OpenAIHelper:
         self._available_models: list[str] = []
         self._model_client_map: dict[str, AsyncOpenAI] = {}
         self._models_fetched_at: datetime | None = None
+        self._models_lock = asyncio.Lock()
         self._default_working_model: str = config.openai_model or "openrouter/free"
 
     async def get_models(self) -> list[str]:
@@ -49,6 +49,18 @@ class OpenAIHelper:
         ):
             return self._available_models
 
+        async with self._models_lock:
+            # Double-check after acquiring lock (another task may have refreshed)
+            if (
+                self._models_fetched_at
+                and datetime.now() - self._models_fetched_at < timedelta(minutes=5)
+            ):
+                return self._available_models
+
+            return await self._fetch_models_locked()
+
+    async def _fetch_models_locked(self) -> list[str]:
+        """Internal model fetcher — must be called under _models_lock."""
         combined_models: list[str] = []
         self._model_client_map.clear()
 
@@ -129,6 +141,21 @@ class OpenAIHelper:
         if (":free" in model or "openrouter" in model.lower()) and self.openrouter_client:
             return self.openrouter_client
         return self.client
+
+    def is_free_model(self, model: str) -> bool:
+        """Check if a model is an OpenRouter free tier model available to free users."""
+        if not model:
+            return True
+        model_lower = model.lower().strip()
+        if ":free" in model_lower or model_lower in ("openrouter/free", "auto"):
+            return True
+        # If model is explicitly mapped to a custom endpoint client (not openrouter), it is Premium
+        if model in self._model_client_map and self.openrouter_client and self._model_client_map[model] != self.openrouter_client:
+            return False
+        # If openrouter model without :free tag (e.g. paid openrouter model)
+        if "openrouter" in model_lower:
+            return False
+        return False
 
     async def test_model(self, model: str, target_client: AsyncOpenAI | None = None) -> bool:
         """Test if a model responds successfully to a completion request without retrying on 429/403 errors."""

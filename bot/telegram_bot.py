@@ -1,12 +1,16 @@
 import asyncio
 import io
 import logging
+import os
 import random
 import re
+import signal
 import sys
+import tempfile
 import time
 import zipfile
 from collections import defaultdict
+from pathlib import Path
 from uuid import uuid4
 
 try:
@@ -25,7 +29,7 @@ from pyrogram.types import (
     Message,
 )
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from bot.config import Config
 from bot.database import Database
@@ -33,6 +37,250 @@ from bot.openai_helper import OpenAIHelper
 from bot.web_search import WebSearch, extract_search_query, is_search_worthy
 
 logger = logging.getLogger(__name__)
+
+# Shared media extension blacklist — used in _extract_document_text and _handle_document
+MEDIA_EXTENSIONS: tuple[str, ...] = (
+    ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".ico", ".tiff", ".svg",
+    ".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".webm", ".m4v", ".3gp",
+    ".mp3", ".wav", ".ogg", ".aac", ".flac", ".m4a",
+)
+
+LANGUAGE_EXTENSION_MAP: dict[str, str] = {
+    # C / C++ / Systems
+    "c": "c",
+    "h": "h",
+    "cpp": "cpp",
+    "c++": "cpp",
+    "cc": "cpp",
+    "cxx": "cpp",
+    "hpp": "hpp",
+    "h++": "hpp",
+    "hxx": "hpp",
+    "hh": "hpp",
+    "csharp": "cs",
+    "c#": "cs",
+    "cs": "cs",
+    "d": "d",
+    "nim": "nim",
+    "rust": "rs",
+    "rs": "rs",
+    "zig": "zig",
+    "odin": "odin",
+    "v": "v",
+    # Java / JVM
+    "java": "java",
+    "kotlin": "kt",
+    "kt": "kt",
+    "kts": "kts",
+    "scala": "scala",
+    "sc": "scala",
+    "groovy": "groovy",
+    "gvy": "groovy",
+    "clojure": "clj",
+    "clj": "clj",
+    "cljs": "cljs",
+    # Python
+    "python": "py",
+    "py": "py",
+    "pyw": "pyw",
+    "pyi": "pyi",
+    "pyx": "pyx",
+    "pyd": "pyd",
+    "ipynb": "ipynb",
+    # JavaScript / TypeScript / Web Ecosystem
+    "javascript": "js",
+    "js": "js",
+    "mjs": "mjs",
+    "cjs": "cjs",
+    "jsx": "jsx",
+    "typescript": "ts",
+    "ts": "ts",
+    "mts": "mts",
+    "cts": "cts",
+    "tsx": "tsx",
+    "vue": "vue",
+    "svelte": "svelte",
+    "astro": "astro",
+    "coffee": "coffee",
+    "coffeescript": "coffee",
+    # Web Markup & Styling
+    "html": "html",
+    "htm": "html",
+    "xhtml": "xhtml",
+    "css": "css",
+    "scss": "scss",
+    "sass": "sass",
+    "less": "less",
+    "styl": "styl",
+    "stylus": "styl",
+    "postcss": "pcss",
+    # Apple / Mobile
+    "swift": "swift",
+    "objc": "m",
+    "objective-c": "m",
+    "m": "m",
+    "mm": "mm",
+    "dart": "dart",
+    "flutter": "dart",
+    # Go / Backend & Cloud
+    "go": "go",
+    "golang": "go",
+    "php": "php",
+    "phtml": "php",
+    "ruby": "rb",
+    "rb": "rb",
+    "erb": "erb",
+    "crystal": "cr",
+    "cr": "cr",
+    "elixir": "ex",
+    "ex": "ex",
+    "exs": "exs",
+    "erlang": "erl",
+    "erl": "erl",
+    "hrl": "hrl",
+    # Functional Languages
+    "haskell": "hs",
+    "hs": "hs",
+    "lhs": "lhs",
+    "ocaml": "ml",
+    "ml": "ml",
+    "mli": "mli",
+    "fsharp": "fs",
+    "f#": "fs",
+    "fs": "fs",
+    "fsi": "fsi",
+    "elm": "elm",
+    "purescript": "purs",
+    "purs": "purs",
+    "lisp": "lisp",
+    "lsp": "lisp",
+    "cl": "lisp",
+    "scheme": "scm",
+    "scm": "scm",
+    "ss": "ss",
+    "racket": "rkt",
+    "rkt": "rkt",
+    # Scripting & Shell
+    "bash": "sh",
+    "sh": "sh",
+    "zsh": "zsh",
+    "fish": "fish",
+    "powershell": "ps1",
+    "ps1": "ps1",
+    "psm1": "psm1",
+    "bat": "bat",
+    "cmd": "cmd",
+    "awk": "awk",
+    "sed": "sed",
+    "perl": "pl",
+    "pl": "pl",
+    "pm": "pm",
+    "tcl": "tcl",
+    "lua": "lua",
+    # Data Science / Scientific Computing
+    "r": "r",
+    "rscript": "r",
+    "julia": "jl",
+    "jl": "jl",
+    "matlab": "matlab",
+    "octave": "m",
+    "fortran": "f90",
+    "f": "f",
+    "for": "for",
+    "f90": "f90",
+    "f95": "f95",
+    "sas": "sas",
+    "stata": "do",
+    "mathematica": "nb",
+    "nb": "nb",
+    "wl": "wl",
+    # Database & Query
+    "sql": "sql",
+    "mysql": "sql",
+    "pgsql": "pgsql",
+    "plsql": "pls",
+    "tsql": "sql",
+    "cql": "cql",
+    "prisma": "prisma",
+    "graphql": "graphql",
+    "gql": "gql",
+    # Serialization, Config & Markup
+    "json": "json",
+    "jsonc": "jsonc",
+    "json5": "json5",
+    "ndjson": "ndjson",
+    "yaml": "yaml",
+    "yml": "yaml",
+    "toml": "toml",
+    "xml": "xml",
+    "svg": "svg",
+    "ini": "ini",
+    "cfg": "cfg",
+    "conf": "conf",
+    "env": "env",
+    "properties": "properties",
+    "csv": "csv",
+    "tsv": "tsv",
+    "markdown": "md",
+    "md": "md",
+    "mdx": "mdx",
+    "tex": "tex",
+    "latex": "tex",
+    "asciidoc": "adoc",
+    "adoc": "adoc",
+    "rst": "rst",
+    "proto": "proto",
+    "protobuf": "proto",
+    # DevOps, Infra & Build Systems
+    "dockerfile": "dockerfile",
+    "docker": "dockerfile",
+    "makefile": "mk",
+    "make": "mk",
+    "mk": "mk",
+    "cmake": "cmake",
+    "terraform": "tf",
+    "tf": "tf",
+    "tfvars": "tfvars",
+    "hcl": "hcl",
+    "nix": "nix",
+    "bicep": "bicep",
+    "vagrantfile": "vagrantfile",
+    # Low-Level, Hardware & Graphics / Shaders
+    "assembly": "asm",
+    "asm": "asm",
+    "s": "s",
+    "nasm": "asm",
+    "glsl": "glsl",
+    "vert": "vert",
+    "frag": "frag",
+    "hlsl": "hlsl",
+    "wgsl": "wgsl",
+    "cuda": "cu",
+    "cu": "cu",
+    "cuh": "cuh",
+    "opencl": "cl",
+    "verilog": "v",
+    "systemverilog": "sv",
+    "sv": "sv",
+    "vhdl": "vhd",
+    "vhd": "vhd",
+    # Legacy / Enterprise / Domain-Specific
+    "cobol": "cob",
+    "cob": "cob",
+    "cbl": "cbl",
+    "pascal": "pas",
+    "pas": "pas",
+    "delphi": "dpr",
+    "ada": "ada",
+    "adb": "adb",
+    "ads": "ads",
+    "abap": "abap",
+    "apex": "cls",
+    "solidity": "sol",
+    "sol": "sol",
+    "wasm": "wasm",
+    "wat": "wat",
+}
 
 
 class TelegramBot:
@@ -46,12 +294,18 @@ class TelegramBot:
             api_hash=config.api_hash,
             bot_token=config.bot_token,
         )
-        self.inline_queries_cache: dict[str, str] = {}
+        self.inline_queries_cache: dict[str, dict] = {}
         self._rate_limits: dict[int, list[float]] = defaultdict(list)
         self._addapi_sessions: dict[int, dict] = {}
         self._addfallback_sessions: dict[int, dict] = {}
         self._last_random_chat: dict[int, float] = defaultdict(float)
         self._start_time: float = time.time()
+        # Cached Telegram API data to avoid per-message API calls
+        self._bot_me: object | None = None
+        self._user_bio_cache: dict[int, tuple[str, float]] = {}  # user_id -> (bio, timestamp)
+        self._admin_cache: dict[int, tuple[list, float]] = {}    # chat_id -> (admin_list, timestamp)
+        self._background_tasks: list[asyncio.Task] = []
+        self._file_semaphore = asyncio.Semaphore(4)  # Max 4 concurrent file processing tasks
         self._register_handlers()
 
     def _register_handlers(self):
@@ -129,14 +383,92 @@ class TelegramBot:
         return True
 
     async def _start(self, client: Client, message: Message):
-        await message.reply_text(
-            "Hey! Send me a message and I'll respond using AI.\n\n"
-            "Commands:\n"
-            "/reset - Clear conversation history\n"
-            "/model <name> - Switch AI model\n"
-            "/models - List available models\n"
-            "/help - Show this message"
+        user_id = message.from_user.id if message.from_user else 0
+        username = message.from_user.username if message.from_user else None
+        if user_id:
+            await self.db.track_user(user_id, username)
+
+        is_admin = self._is_admin(user_id)
+        prem_info = await self.db.get_premium_info(user_id) if user_id else None
+
+        if prem_info and prem_info.get("is_admin"):
+            status_str = "👑 **Membership Status: PREMIUM (Lifetime Admin Access)** 💎"
+        elif prem_info and prem_info.get("premium_until"):
+            exp_date_str = prem_info["premium_until"].strftime("%B %d, %Y")
+            status_str = f"🌟 **Membership Status: PREMIUM Member** 💎\n⏳ **Remaining Access**: `{prem_info['remaining_days']} days` (Valid until {exp_date_str})"
+        elif prem_info:
+            status_str = f"🌟 **Membership Status: PREMIUM Member** 💎 (Active for `{prem_info.get('remaining_days', self.config.premium_duration_days)} days`)"
+        else:
+            status_str = "⚪ **Membership Status: FREE Member**"
+
+        # Premium Showcase section for free users
+        premium_showcase = ""
+        if not prem_info:
+            premium_showcase = (
+                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                "💎 **UNLOCK GGQT BOT PREMIUM BENEFITS** 🚀\n"
+                "• 💻 **Aider-Style Code Generation**: Dedicated `/code` command for clean, complete, production-ready software engineering.\n"
+                "• 📁 **Multi-File Codebase & PDF Analysis**: Upload `.zip` codebase repositories, `.pdf` documents, and raw scripts for deep AI analysis.\n"
+                "• ⚡ **Deep Context Memory**: Extended 100-message buffer (24h retention) with 40,000 characters context per prompt.\n"
+                "• 💾 **Auto Code File Delivery**: Download generated `.py`, `.js`, `.ts`, `.rs`, `.go` files directly in chat.\n"
+                "• 🚀 **Zero Rate Limits**: Instant responses with priority throughput.\n\n"
+                "💰 **SUBSCRIPTION PRICING:**\n"
+                f"• **Price**: `{self.config.premium_price}` (USDT / BNB equivalent)\n"
+                f"• **Duration**: `{self.config.premium_duration_days} Days` (3 Full Months Access)\n"
+                f"• **Network**: `{self.config.payment_network}`\n"
+                f"• **Deposit Address**: (tap to copy)\n`{self.config.payment_address}`\n"
+                f"• **Activation**: Send payment and forward Tx Hash / Scan ID to Admin **{self.config.admin_contact}**.\n"
+            )
+
+        text = (
+            "👋 **Welcome to GGQT AI Assistant!** 🐾✨\n"
+            "I am your high-performance, multi-model AI assistant and coding partner.\n\n"
+            f"{status_str}\n\n"
+            f"{premium_showcase}"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "⚙️ **ALL AVAILABLE COMMANDS:**\n"
+            "• `/start` — Welcome dashboard, membership tier & price list\n"
+            "• `/stats` — View your account status, active model & message metrics\n"
+            "• `/premium` — View Premium tier benefits, price list & deposit address\n"
+            "• `/code <prompt>` — Aider-style advanced code generation & engineering (Premium)\n"
+            "• `/models` — Interactive menu to browse & switch AI models\n"
+            "• `/model <name>` — Switch AI model directly\n"
+            "• `/search <query>` — Search the web with live DuckDuckGo results\n"
+            "• `/reset` — Clear conversation history\n"
+            "• `/help` — Full command manual and tips\n"
         )
+
+        if is_admin:
+            text += (
+                "\n👑 **Admin Commands:**\n"
+                "• `/addpremium <id> [days]` — Grant Premium tier status\n"
+                "• `/removepremium <id>` — Revoke Premium status\n"
+                "• `/premiums` — List active Premium users\n"
+                "• `/addapi` — Add custom OpenAI-compatible API endpoint\n"
+                "• `/removeapi` — Remove custom API endpoints\n"
+                "• `/apis` — List custom API endpoints\n"
+                "• `/addfallback` — Add fallback model to priority chain\n"
+                "• `/removefallback` — Remove fallback models\n"
+                "• `/fallbacks` — View active fallback chain\n"
+                "• `/cancel` — Cancel active setup session\n"
+            )
+
+        text += (
+            "\n━━━━━━━━━━━━━━━━━━━━━━\n"
+            "📁 **FILE & CODEBASE ANALYSIS (PREMIUM ONLY):**\n"
+            "• Send any `.pdf`, `.zip` codebase archive, or code file (`.py`, `.js`, `.json`, `.cpp`, `.rs`, `.go`, `.txt`, `.md`) in private chat for instant AI analysis!\n"
+            "• Reply to any file with instructions or `/code` to analyze, fix, or refactor.\n\n"
+            "💬 *Send me any message to begin chatting!*"
+        )
+
+        buttons = [
+            [
+                InlineKeyboardButton("🤖 Choose AI Model", callback_data="models_page:0"),
+                InlineKeyboardButton("💎 Upgrade to Premium ($8 / 90d)", url=f"https://t.me/{self.config.admin_contact.lstrip('@')}") if self.config.admin_contact.startswith("@") else InlineKeyboardButton("💎 Premium Details", callback_data="models_cancel"),
+            ]
+        ]
+        markup = InlineKeyboardMarkup(buttons)
+        await message.reply_text(text, reply_markup=markup)
 
     async def _reset(self, client: Client, message: Message):
         await self.db.reset_conversation(message.chat.id)
@@ -162,7 +494,7 @@ class TelegramBot:
             "• `/search <query>` — Search the web with live DuckDuckGo results\n"
             "• `/reset` — Clear your conversation memory history\n"
             "• `/help` — Display this help menu\n\n"
-            "📁 **File Uploads**: Send any `.py`, `.js`, `.json`, `.txt`, `.md`, `.cpp`, `.rs`, `.go` file with a caption to analyze!\n\n"
+            "📁 **File Uploads (Premium)**: Send any `.pdf`, `.zip` codebase, or code/text file with a caption to analyze!\n\n"
         )
 
         if is_admin:
@@ -184,38 +516,103 @@ class TelegramBot:
         text += "💡 **Pro Tip**: Use `/models` to switch between OpenRouter free models & custom endpoints!"
         await message.reply_text(text)
 
+    async def _resolve_target_user(self, client: Client, message: Message, target_arg: str = "") -> tuple[int | None, str]:
+        """Resolve a target user ID from replied message, username (@uname), or numerical ID."""
+        # 1. If replying to a user's message
+        if message.reply_to_message and message.reply_to_message.from_user:
+            u = message.reply_to_message.from_user
+            uname = f"@{u.username}" if u.username else (f"{u.first_name or ''} {u.last_name or ''}".strip() or "User")
+            return (u.id, uname)
+
+        if not target_arg:
+            return (None, "")
+
+        # 2. If target is numerical ID
+        if target_arg.isdigit() or (target_arg.startswith("-") and target_arg[1:].isdigit()):
+            return (int(target_arg), f"ID: {target_arg}")
+
+        # 3. If target is @username
+        uname_clean = target_arg.lstrip("@").strip()
+        try:
+            user = await client.get_users(uname_clean)
+            if user:
+                uname_display = f"@{user.username}" if user.username else (user.first_name or "User")
+                return (user.id, uname_display)
+        except Exception:
+            pass
+
+        # 4. Check MongoDB database for username
+        escaped_uname = re.escape(uname_clean)
+        doc = await self.db.users.find_one({"username": {"$regex": f"^{escaped_uname}$", "$options": "i"}})
+        if doc and doc.get("user_id"):
+            return (doc["user_id"], f"@{doc.get('username') or uname_clean}")
+
+        return (None, target_arg)
+
     async def _addpremium(self, client: Client, message: Message):
         if not self._is_admin(message.from_user.id):
             await message.reply_text("Only admins can grant premium status.")
             return
+
         parts = message.text.split()
-        if len(parts) < 2:
-            await message.reply_text("Usage: /addpremium <user_id> [days=90]")
+        target_arg = ""
+        days = self.config.premium_duration_days
+
+        # Case 1: Reply to message (e.g. reply with "/addpremium" or "/addpremium 90")
+        if message.reply_to_message and message.reply_to_message.from_user:
+            if len(parts) >= 2 and parts[1].isdigit():
+                days = int(parts[1])
+        # Case 2: Argument provided (e.g. "/addpremium 123456789 90" or "/addpremium @user 90")
+        elif len(parts) >= 2:
+            target_arg = parts[1]
+            if len(parts) >= 3 and parts[2].isdigit():
+                days = int(parts[2])
+        else:
+            await message.reply_text(
+                "ℹ️ **Add Premium Usage:**\n\n"
+                "• `/addpremium <user_id> [days=90]`\n"
+                "• `/addpremium @username [days=90]`\n"
+                "• Or reply to any user's message with `/addpremium [days=90]`"
+            )
             return
+
+        target_id, target_name = await self._resolve_target_user(client, message, target_arg)
+        if not target_id:
+            await message.reply_text(f"⚠️ Could not find user `{target_arg}`. Please provide a valid user ID, @username, or reply to their message.")
+            return
+
         try:
-            target_id = int(parts[1].strip())
-            days = int(parts[2].strip()) if len(parts) >= 3 else self.config.premium_duration_days
-        except ValueError:
-            await message.reply_text("User ID and days must be valid numbers.")
-            return
-        await self.db.set_premium(target_id, True, days=days)
-        await message.reply_text(f"🌟 User `{target_id}` granted **PREMIUM** tier status for **{days} days**! 💎")
+            await self.db.set_premium(target_id, True, days=days)
+            exp_date_str = (datetime.now() + timedelta(days=days)).strftime("%B %d, %Y")
+            await message.reply_text(
+                f"🌟 **User `{target_id}` ({target_name}) granted PREMIUM status!** 💎\n\n"
+                f"• **Duration**: `{days} days`\n"
+                f"• **Valid Until**: `{exp_date_str}`\n\n"
+                f"*(After {days} days, the subscription will automatically expire and the user will revert to Free status)*"
+            )
+        except Exception as e:
+            logger.error(f"Failed to add premium for {target_id}: {e}")
+            await message.reply_text(f"❌ Failed to grant premium: {e}")
 
     async def _removepremium(self, client: Client, message: Message):
         if not self._is_admin(message.from_user.id):
             await message.reply_text("Only admins can revoke premium status.")
             return
+
         parts = message.text.split(maxsplit=1)
-        if len(parts) < 2:
-            await message.reply_text("Usage: /removepremium <user_id>")
+        target_arg = parts[1].strip() if len(parts) >= 2 else ""
+
+        target_id, target_name = await self._resolve_target_user(client, message, target_arg)
+        if not target_id:
+            await message.reply_text("Usage: `/removepremium <user_id>` or `/removepremium @username` or reply with `/removepremium`.")
             return
+
         try:
-            target_id = int(parts[1].strip())
-        except ValueError:
-            await message.reply_text("User ID must be a number.")
-            return
-        await self.db.set_premium(target_id, False)
-        await message.reply_text(f"User `{target_id}` premium status has been revoked.")
+            await self.db.set_premium(target_id, False)
+            await message.reply_text(f"✅ User `{target_id}` ({target_name}) premium status has been revoked.")
+        except Exception as e:
+            logger.error(f"Failed to remove premium for {target_id}: {e}")
+            await message.reply_text(f"❌ Failed to revoke premium: {e}")
 
     async def _list_premiums(self, client: Client, message: Message):
         if not self._is_admin(message.from_user.id):
@@ -773,7 +1170,7 @@ class TelegramBot:
     async def _deny_access(self, message: Message):
         await message.reply_text(
             "You don't have access to this bot.\n"
-            "Contact @alex5402 to get access."
+            f"Contact {self.config.admin_contact} to get access."
         )
 
     async def _premium(self, client: Client, message: Message):
@@ -842,99 +1239,129 @@ class TelegramBot:
             )
             return
 
-        prompt = parts[1].strip() if len(parts) >= 2 else (message.text or "[Code analysis request]")
+        prompt = parts[1].strip() if len(parts) >= 2 else "[Code analysis request]"
         await self._respond(message, prompt, is_code_mode=True)
 
     async def _handle_unsupported_media(self, client: Client, message: Message):
         """Politely reject photo, video, audio, and animation uploads."""
         await message.reply_text("⚠️ Image and video processing is not supported. Please send code, text, PDF, or ZIP codebase files instead! 💻📄")
 
-    async def _extract_document_text(self, document, message_context: Message, is_prem: bool = False) -> tuple[str, str] | None:
-        """Extract text from a document (PDF, ZIP codebase, or text/code file). Returns (file_type_desc, extracted_text)."""
+    async def _extract_document_text(self, document, message_context: Message | None = None, is_prem: bool = False) -> tuple[str, str] | None:
+        """Extract text from a document (PDF, ZIP codebase, or text/code file) via temporary disk streaming. Restricted strictly to Premium users."""
+        if not is_prem:
+            return None
+
         file_name = document.file_name or "document.txt"
         file_size = document.file_size or 0
         if file_size > 20 * 1024 * 1024:
             return None
 
         # Reject image, video, and media file formats
-        media_extensions = (
-            ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".ico", ".tiff", ".svg",
-            ".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".webm", ".m4v", ".3gp",
-            ".mp3", ".wav", ".ogg", ".aac", ".flac", ".m4a"
-        )
-        if any(file_name.lower().endswith(ext) for ext in media_extensions):
+        if any(file_name.lower().endswith(ext) for ext in MEDIA_EXTENSIONS):
             return None
         if document.mime_type and any(document.mime_type.startswith(m) for m in ("image/", "video/", "audio/")):
             return None
 
+        # Create temporary file in ./temp directory for streaming download
+        temp_dir = Path("./temp")
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        tmp = tempfile.NamedTemporaryFile(dir=str(temp_dir), suffix=f"_{os.path.basename(file_name)}", delete=False)
+        tmp_path = str(tmp.name)
+        tmp.close()
+
         try:
-            downloaded = await message_context.download(in_memory=True)
-            file_bytes = bytes(downloaded.getbuffer())
-            file_text = ""
-            file_type_desc = "Document"
+            async with self._file_semaphore:
+                # Stream download directly to temporary disk file
+                download_res = await self.app.download_media(document.file_id, file_name=tmp_path)
+                if not download_res and message_context:
+                    # Fallback: try message_context.download
+                    download_res = await message_context.download(file_name=tmp_path)
 
-            # 1. PDF Document Extraction
-            if file_name.lower().endswith(".pdf"):
-                file_type_desc = "PDF Document"
-                if HAS_PYPDF:
-                    pdf_stream = io.BytesIO(file_bytes)
-                    reader = PdfReader(pdf_stream)
-                    extracted_pages = []
-                    max_pages = min(len(reader.pages), 40 if is_prem else 15)
-                    for idx in range(max_pages):
-                        page = reader.pages[idx]
-                        p_text = page.extract_text() or ""
-                        if p_text.strip():
-                            extracted_pages.append(f"--- Page {idx + 1} ---\n{p_text.strip()}")
-                    file_text = "\n\n".join(extracted_pages)
-                    if len(reader.pages) > max_pages:
-                        file_text += f"\n\n[Note: Truncated to first {max_pages} of {len(reader.pages)} pages]"
+                if not download_res or not os.path.exists(tmp_path):
+                    logger.debug(f"Failed to download document {file_name}: file not found")
+                    return None
 
-            # 2. ZIP Codebase Archive Extraction
-            elif file_name.lower().endswith(".zip"):
-                file_type_desc = "Codebase ZIP Archive"
-                zip_stream = io.BytesIO(file_bytes)
-                valid_extensions = (
-                    ".py", ".js", ".ts", ".jsx", ".tsx", ".html", ".css", ".json", ".txt",
-                    ".md", ".csv", ".log", ".cpp", ".c", ".h", ".hpp", ".rs", ".go",
-                    ".java", ".sh", ".bash", ".yml", ".yaml", ".sql", ".env", ".xml",
-                    ".ini", ".conf", ".toml", ".dart", ".kt", ".swift", ".rb", ".php"
-                )
-                ignored_dirs = ("node_modules/", ".git/", "__pycache__/", "dist/", "build/", "venv/", ".env/")
-                extracted_files = []
-                with zipfile.ZipFile(zip_stream, "r") as z:
-                    for z_info in z.infolist():
-                        if z_info.is_dir():
-                            continue
-                        fname = z_info.filename
-                        if any(fname.startswith(d) or f"/{d}" in fname for d in ignored_dirs):
-                            continue
-                        if not fname.lower().endswith(valid_extensions):
-                            continue
-                        try:
-                            content_b = z.read(z_info)
+                file_text = ""
+                file_type_desc = "Document"
+
+                # 1. PDF Document Extraction (Streaming from disk)
+                if file_name.lower().endswith(".pdf"):
+                    file_type_desc = "PDF Document"
+                    if HAS_PYPDF:
+                        reader = PdfReader(tmp_path)
+                        extracted_pages = []
+                        max_pages = min(len(reader.pages), 40 if is_prem else 15)
+                        for idx in range(max_pages):
+                            page = reader.pages[idx]
+                            p_text = page.extract_text() or ""
+                            if p_text.strip():
+                                extracted_pages.append(f"--- Page {idx + 1} ---\n{p_text.strip()}")
+                        file_text = "\n\n".join(extracted_pages)
+                        if len(reader.pages) > max_pages:
+                            file_text += f"\n\n[Note: Truncated to first {max_pages} of {len(reader.pages)} pages]"
+
+                # 2. ZIP Codebase Archive Extraction (Inspecting directly on disk)
+                elif file_name.lower().endswith(".zip"):
+                    file_type_desc = "Codebase ZIP Archive"
+                    valid_extensions = (
+                        ".py", ".js", ".ts", ".jsx", ".tsx", ".html", ".css", ".json", ".txt",
+                        ".md", ".csv", ".log", ".cpp", ".c", ".h", ".hpp", ".rs", ".go",
+                        ".java", ".sh", ".bash", ".yml", ".yaml", ".sql", ".env", ".xml",
+                        ".ini", ".conf", ".toml", ".dart", ".kt", ".swift", ".rb", ".php"
+                    )
+                    ignored_dirs = ("node_modules/", ".git/", "__pycache__/", "dist/", "build/", "venv/", ".env/")
+                    extracted_files = []
+                    total_extracted_bytes = 0
+                    max_total_bytes = 10 * 1024 * 1024  # 10MB total decompressed cap
+                    max_single_file = 2 * 1024 * 1024   # 2MB per file decompressed cap
+                    with zipfile.ZipFile(tmp_path, "r") as z:
+                        for z_info in z.infolist():
+                            if z_info.is_dir():
+                                continue
+                            fname = z_info.filename
+                            if any(fname.startswith(d) or f"/{d}" in fname for d in ignored_dirs):
+                                continue
+                            if not fname.lower().endswith(valid_extensions):
+                                continue
+                            # ZIP bomb protection: check uncompressed size
+                            if z_info.file_size > max_single_file:
+                                continue
+                            if total_extracted_bytes + z_info.file_size > max_total_bytes:
+                                break
                             try:
-                                c_text = content_b.decode("utf-8")
-                            except UnicodeDecodeError:
-                                c_text = content_b.decode("latin-1", errors="replace")
-                            extracted_files.append(f"=== File: {fname} ===\n{c_text[:4000]}")
-                        except Exception:
-                            continue
-                if extracted_files:
-                    file_text = "\n\n".join(extracted_files[:30])
+                                content_b = z.read(z_info)
+                                total_extracted_bytes += len(content_b)
+                                try:
+                                    c_text = content_b.decode("utf-8")
+                                except UnicodeDecodeError:
+                                    c_text = content_b.decode("latin-1", errors="replace")
+                                extracted_files.append(f"=== File: {fname} ===\n{c_text[:4000]}")
+                            except Exception:
+                                continue
+                    if extracted_files:
+                        file_text = "\n\n".join(extracted_files[:30])
 
-            # 3. Standard Text / Code File
-            else:
-                try:
-                    file_text = file_bytes.decode("utf-8")
-                except UnicodeDecodeError:
-                    file_text = file_bytes.decode("latin-1", errors="replace")
+                # 3. Standard Text / Code File (Streaming slice from disk)
+                else:
+                    file_type_desc = "Code/Text File"
+                    try:
+                        with open(tmp_path, "r", encoding="utf-8", errors="replace") as f:
+                            file_text = f.read(45000)
+                    except Exception as read_err:
+                        logger.debug(f"Failed to read text file {file_name}: {read_err}")
 
-            file_text = self._sanitize_utf8(file_text)
-            if file_text.strip():
-                return (file_type_desc, file_text)
+                file_text = self._sanitize_utf8(file_text)
+                if file_text.strip():
+                    return (file_type_desc, file_text)
         except Exception as e:
             logger.debug(f"Failed to extract text from document {file_name}: {e}")
+        finally:
+            # Immediate cleanup of temporary disk file
+            if os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
 
         return None
 
@@ -952,13 +1379,20 @@ class TelegramBot:
         is_prem = await self.db.is_premium(user_id)
 
         # Reject image and video files
-        media_extensions = (
-            ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".ico", ".tiff", ".svg",
-            ".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".webm", ".m4v", ".3gp",
-            ".mp3", ".wav", ".ogg", ".aac", ".flac", ".m4a"
-        )
-        if any(file_name.lower().endswith(ext) for ext in media_extensions) or (doc.mime_type and any(doc.mime_type.startswith(m) for m in ("image/", "video/", "audio/"))):
+        if any(file_name.lower().endswith(ext) for ext in MEDIA_EXTENSIONS) or (doc.mime_type and any(doc.mime_type.startswith(m) for m in ("image/", "video/", "audio/"))):
             await message.reply_text("⚠️ Image and video files are not supported. Please send code, text, PDF, or ZIP codebase files instead! 💻📄")
+            return
+
+        # Check Premium status - File analysis is strictly Premium only
+        if not is_prem:
+            await message.reply_text(
+                "🔒 **Document & Codebase Analysis is a Premium Feature!** 📁💎\n\n"
+                "Premium members can upload multi-file `.zip` codebases, `.pdf` documents, and code files for deep AI analysis and refactoring with a 40,000-character context.\n\n"
+                f"💰 **Subscription Price**: `{self.config.premium_price}` for `{self.config.premium_duration_days} Days`\n"
+                f"💳 **Deposit Address** (BSC): `{self.config.payment_address}`\n"
+                f"📩 Forward payment proof to **{self.config.admin_contact}** to unlock!\n\n"
+                "Type `/premium` to view all details."
+            )
             return
 
         # Maximum file upload limit: 20 MB
@@ -1004,10 +1438,15 @@ class TelegramBot:
         if len(self._rate_limits[user_id]) >= max_requests:
             return True
         self._rate_limits[user_id].append(now)
+        # Periodic purge: remove stale user entries to prevent memory leak
+        if random.random() < 0.02:  # ~2% chance per call
+            stale_keys = [k for k, v in self._rate_limits.items() if not v or (now - max(v, default=0)) > window * 2]
+            for k in stale_keys:
+                del self._rate_limits[k]
         return False
 
     def _build_models_keyboard(self, models: list[str], current_model: str, page: int = 0) -> InlineKeyboardMarkup:
-        """Build a paginated inline keyboard menu showing 9 models per page with Prev, Cancel, and Next controls."""
+        """Build a paginated inline keyboard menu showing 9 models per page with Free/Premium badges and controls."""
         page_size = 9
         total_models = len(models)
         total_pages = (total_models + page_size - 1) // page_size if total_models > 0 else 1
@@ -1020,9 +1459,18 @@ class TelegramBot:
         for idx in range(start_idx, end_idx):
             m = models[idx]
             is_active = (m == current_model)
-            prefix = "✅ " if is_active else "🤖 "
-            label = f"{prefix}{m}"
-            buttons.append([InlineKeyboardButton(label, callback_data=f"setmodel:{idx}")])
+            is_free = self.openai.is_free_model(m)
+
+            if is_active:
+                prefix = "✅ "
+            elif is_free:
+                prefix = "🟢 "
+            else:
+                prefix = "💎 "
+
+            badge = "[Free]" if is_free else "[Prem]"
+            label = f"{prefix}{m} {badge}" if not is_active else f"{prefix}{m}"
+            buttons.append([InlineKeyboardButton(label, callback_data=f"setmodel:{m[:48]}")])
 
         # Navigation row: Prev | Cancel | Next
         nav_row = []
@@ -1043,14 +1491,19 @@ class TelegramBot:
             return
         models = await self.openai.get_models()
         user_id = message.from_user.id
+        is_prem = await self.db.is_premium(user_id)
         user_model = await self.db.get_user_model(user_id)
         current = user_model or self.openai.get_current_model()
         total_pages = (len(models) + 8) // 9 if models else 1
 
+        tier_badge = "💎 **PREMIUM Tier**" if is_prem else "⚪ **FREE Tier**"
         text = (
             "🤖 **Select Your AI Model**\n\n"
-            f"Active model: `{current}`\n"
-            f"Page `1/{total_pages}` (Total: {len(models)} models)\n\n"
+            f"• **Your Status**: {tier_badge}\n"
+            f"• **Active Model**: `{current}`\n"
+            f"• **Page**: `1/{total_pages}` (Total: {len(models)} models)\n\n"
+            "🟢 `[Free]` = OpenRouter Free Tier (Available to all users)\n"
+            "💎 `[Prem]` = Custom Provider Model (Premium Only)\n\n"
             "Click any model below to select it:"
         )
         markup = self._build_models_keyboard(models, current, page=0)
@@ -1068,14 +1521,19 @@ class TelegramBot:
             page = 0
 
         models = await self.openai.get_models()
+        is_prem = await self.db.is_premium(user_id)
         user_model = await self.db.get_user_model(user_id)
         current = user_model or self.openai.get_current_model()
         total_pages = (len(models) + 8) // 9 if models else 1
 
+        tier_badge = "💎 **PREMIUM Tier**" if is_prem else "⚪ **FREE Tier**"
         text = (
             "🤖 **Select Your AI Model**\n\n"
-            f"Active model: `{current}`\n"
-            f"Page `{page + 1}/{total_pages}` (Total: {len(models)} models)\n\n"
+            f"• **Your Status**: {tier_badge}\n"
+            f"• **Active Model**: `{current}`\n"
+            f"• **Page**: `{page + 1}/{total_pages}` (Total: {len(models)} models)\n\n"
+            "🟢 `[Free]` = OpenRouter Free Tier (Available to all users)\n"
+            "💎 `[Prem]` = Custom Provider Model (Premium Only)\n\n"
             "Click any model below to select it:"
         )
         markup = self._build_models_keyboard(models, current, page=page)
@@ -1105,6 +1563,17 @@ class TelegramBot:
         if model_name not in models:
             await message.reply_text(f"Model `{model_name}` not found. Use /models to list available.")
             return
+
+        is_free = self.openai.is_free_model(model_name)
+        is_prem = await self.db.is_premium(user_id)
+        if not is_free and not is_prem:
+            await message.reply_text(
+                f"🔒 **`{model_name}` is a Premium Custom Provider Model!** 💎\n\n"
+                "Free tier users can select any OpenRouter free model (labeled `[Free]`).\n\n"
+                f"💰 Upgrade to Premium for `{self.config.premium_price}` / `{self.config.premium_duration_days} Days` with `/premium` to unlock all custom endpoints!"
+            )
+            return
+
         await self.db.set_user_model(user_id, model_name)
         await message.reply_text(f"Switched model to `{model_name}`.")
 
@@ -1114,16 +1583,24 @@ class TelegramBot:
             await callback_query.answer("Access denied.", show_alert=True)
             return
 
-        data = callback_query.data  # "setmodel:<idx>"
+        data = callback_query.data  # "setmodel:<model_name>"
         try:
-            idx = int(data.split(":", 1)[1])
+            target_model = data.split(":", 1)[1].strip()
             models = await self.openai.get_models()
-            if idx < 0 or idx >= len(models):
-                await callback_query.answer("Model not found.", show_alert=True)
+            if target_model not in models:
+                await callback_query.answer("Model not found or no longer available.", show_alert=True)
                 return
-            target_model = models[idx]
         except (ValueError, IndexError):
             await callback_query.answer("Invalid selection.", show_alert=True)
+            return
+
+        is_free = self.openai.is_free_model(target_model)
+        is_prem = await self.db.is_premium(user_id)
+        if not is_free and not is_prem:
+            await callback_query.answer(
+                "🔒 Custom provider models are reserved for Premium members! Upgrade with /premium ($8 / 90d).",
+                show_alert=True
+            )
             return
 
         await self.db.set_user_model(user_id, target_model)
@@ -1158,7 +1635,9 @@ class TelegramBot:
         if not message.text or not message.from_user:
             return
 
-        me = await client.get_me()
+        if not self._bot_me:
+            self._bot_me = client.me or await client.get_me()
+        me = self._bot_me
         bot_username = me.username
         bot_id = me.id
         triggers = self.config.group_trigger_keywords or [self.config.group_trigger_keyword]
@@ -1284,12 +1763,18 @@ class TelegramBot:
         sender_bio = "Not set / Private"
 
         if sender and sender.id:
-            try:
-                user_chat = await self.app.get_chat(sender.id)
-                if user_chat and user_chat.bio:
-                    sender_bio = user_chat.bio
-            except Exception:
-                pass
+            bio_ttl = 300  # 5-minute cache TTL for user bios
+            cached_bio = self._user_bio_cache.get(sender.id)
+            if cached_bio and (time.time() - cached_bio[1]) < bio_ttl:
+                sender_bio = cached_bio[0]
+            else:
+                try:
+                    user_chat = await self.app.get_chat(sender.id)
+                    if user_chat and user_chat.bio:
+                        sender_bio = user_chat.bio
+                    self._user_bio_cache[sender.id] = (sender_bio, time.time())
+                except Exception:
+                    pass
 
         user_context = (
             f"User Speaking with You:\n"
@@ -1303,26 +1788,57 @@ class TelegramBot:
         reply_context = ""
         if message.reply_to_message:
             r_msg = message.reply_to_message
+
+            # Re-fetch the replied message to get fully hydrated data (documents, captions, etc.)
+            # Pyrogram's reply_to_message often returns partial/incomplete objects for old messages.
+            try:
+                r_msg_full = await self.app.get_messages(message.chat.id, r_msg.id)
+                if r_msg_full and not r_msg_full.empty:
+                    r_msg = r_msg_full
+            except Exception as e:
+                logger.debug(f"Could not re-fetch replied message {r_msg.id}: {e}")
+
             r_sender = r_msg.from_user
             r_name = f"{r_sender.first_name or ''} {r_sender.last_name or ''}".strip() if r_sender else "Unknown"
             r_uname_str = f"@{r_sender.username}" if r_sender and r_sender.username else "None"
             r_id = r_sender.id if r_sender else "Unknown"
             r_text = r_msg.text or r_msg.caption or "[Media / Non-text content]"
 
-            # If replied message has a document attached, extract and include its content!
+            # If replied message has a document attached
             replied_doc_context = ""
             if r_msg.document:
-                doc_res = await self._extract_document_text(r_msg.document, r_msg, is_prem=is_prem)
-                if doc_res:
-                    doc_desc, doc_content = doc_res
-                    doc_name = r_msg.document.file_name or "document.txt"
-                    char_limit = 40000 if is_prem else 15000
-                    replied_doc_context = (
-                        f"\n\n📁 [Replied Message Attached {doc_desc}: `{doc_name}`]:\n"
-                        f"```\n"
-                        f"{doc_content[:char_limit]}\n"
-                        f"```"
-                    )
+                if not is_prem:
+                    # Non-premium user trying to analyze a replied document
+                    analyze_keywords = ("analyze", "review", "explain", "fix", "code", "read", "check", "what", "show", "extract", "look")
+                    if user_text and any(kw in user_text.lower() for kw in analyze_keywords):
+                        await message.reply_text(
+                            "🔒 **File Analysis is a Premium Feature!**\n\n"
+                            "📄 Document analysis (PDF, code, ZIP archives) is exclusively available to **Premium** subscribers.\n\n"
+                            "✨ **Premium Benefits:**\n"
+                            "• 📁 Analyze code files, PDFs & ZIP archives\n"
+                            "• 🤖 Access to all custom AI models\n"
+                            "• ⚡ Priority response times\n"
+                            "• 🔓 Unlimited features\n\n"
+                            "Contact the admin to upgrade! 💎"
+                        )
+                        return
+                else:
+                    doc_res = await self._extract_document_text(r_msg.document, r_msg, is_prem=is_prem)
+                    if doc_res:
+                        doc_desc, doc_content = doc_res
+                        doc_name = r_msg.document.file_name or "document.txt"
+                        char_limit = 40000
+                        replied_doc_context = (
+                            f"\n\n📁 [Replied Message Attached {doc_desc}: `{doc_name}`]:\n"
+                            f"```\n"
+                            f"{doc_content[:char_limit]}\n"
+                            f"```"
+                        )
+                    else:
+                        replied_doc_context = (
+                            f"\n\n⚠️ [Replied message had a document (`{r_msg.document.file_name or 'unknown'}`) "
+                            f"but content extraction failed. The file may be binary, corrupted, or too large.]"
+                        )
 
             reply_context = (
                 f"\n\nContext - Replying to message:\n"
@@ -1364,30 +1880,38 @@ class TelegramBot:
         # 7. Group Admin Context (fetch admin list when in a group)
         admin_context = ""
         if not is_private:
-            try:
-                admins = []
-                async for member in self.app.get_chat_members(chat_id, filter=enums.ChatMembersFilter.ADMINISTRATORS):
-                    u = member.user
-                    if u and not u.is_bot:
-                        a_name = f"{u.first_name or ''} {u.last_name or ''}".strip() or "Unknown"
-                        a_uname = f"@{u.username}" if u.username else "No username"
-                        a_title = f" — \"{member.title}\"" if member.title else ""
-                        role = "Owner" if member.status == enums.ChatMemberStatus.OWNER else "Admin"
-                        privs = []
-                        if member.privileges:
-                            p = member.privileges
-                            if p.can_delete_messages: privs.append("delete_msgs")
-                            if p.can_restrict_members: privs.append("ban/restrict")
-                            if p.can_promote_members: privs.append("promote")
-                            if p.can_manage_chat: privs.append("manage_chat")
-                            if p.can_pin_messages: privs.append("pin")
-                            if p.can_invite_users: privs.append("invite")
-                        priv_str = f" [{', '.join(privs)}]" if privs else ""
-                        admins.append(f"  • {a_name} ({a_uname}) — {role}{a_title}{priv_str}")
-                if admins:
-                    admin_context = f"\n\n👑 Group Admins:\n" + "\n".join(admins)
-            except Exception as e:
-                logger.debug(f"Failed to fetch group admins: {e}")
+            admin_cache_ttl = 600  # 10-minute cache TTL for admin lists
+            cached_admins = self._admin_cache.get(chat_id)
+            if cached_admins and (time.time() - cached_admins[1]) < admin_cache_ttl:
+                admin_lines = cached_admins[0]
+                if admin_lines:
+                    admin_context = f"\n\n👑 Group Admins:\n" + "\n".join(admin_lines)
+            else:
+                try:
+                    admins = []
+                    async for member in self.app.get_chat_members(chat_id, filter=enums.ChatMembersFilter.ADMINISTRATORS):
+                        u = member.user
+                        if u and not u.is_bot:
+                            a_name = f"{u.first_name or ''} {u.last_name or ''}".strip() or "Unknown"
+                            a_uname = f"@{u.username}" if u.username else "No username"
+                            a_title = f" — \"{member.title}\"" if member.title else ""
+                            role = "Owner" if member.status == enums.ChatMemberStatus.OWNER else "Admin"
+                            privs = []
+                            if member.privileges:
+                                p = member.privileges
+                                if p.can_delete_messages: privs.append("delete_msgs")
+                                if p.can_restrict_members: privs.append("ban/restrict")
+                                if p.can_promote_members: privs.append("promote")
+                                if p.can_manage_chat: privs.append("manage_chat")
+                                if p.can_pin_messages: privs.append("pin")
+                                if p.can_invite_users: privs.append("invite")
+                            priv_str = f" [{', '.join(privs)}]" if privs else ""
+                            admins.append(f"  • {a_name} ({a_uname}) — {role}{a_title}{priv_str}")
+                    self._admin_cache[chat_id] = (admins, time.time())
+                    if admins:
+                        admin_context = f"\n\n👑 Group Admins:\n" + "\n".join(admins)
+                except Exception as e:
+                    logger.debug(f"Failed to fetch group admins: {e}")
 
         context_prompt = (
             f"### Current Real-Time Context:\n"
@@ -1512,21 +2036,7 @@ class TelegramBot:
                     code_blocks.sort(key=lambda x: len(x[1]), reverse=True)
                     lang, code_content = code_blocks[0]
                     if len(code_content.strip()) >= 50:
-                        ext_map = {
-                            "python": "py", "py": "py",
-                            "javascript": "js", "js": "js",
-                            "typescript": "ts", "ts": "ts",
-                            "html": "html", "css": "css",
-                            "cpp": "cpp", "c": "c", "c++": "cpp",
-                            "rust": "rs", "rs": "rs",
-                            "go": "go", "golang": "go",
-                            "java": "java", "json": "json",
-                            "sql": "sql", "sh": "sh", "bash": "sh",
-                            "yaml": "yaml", "yml": "yaml", "xml": "xml",
-                            "php": "php", "ruby": "rb", "swift": "swift",
-                            "kotlin": "kt", "dart": "dart",
-                        }
-                        ext = ext_map.get(lang.lower().strip(), "py" if is_code_mode else "txt")
+                        ext = LANGUAGE_EXTENSION_MAP.get(lang.lower().strip(), "py" if is_code_mode else "txt")
                         out_filename = f"generated_code.{ext}"
                         # Check if a filename was mentioned in the code or prompt
                         fn_match = re.search(r'#\s*(?:filename|file):\s*([a-zA-Z0-9_.-]+)', code_content, re.IGNORECASE)
@@ -1573,7 +2083,13 @@ class TelegramBot:
             "sender_name": sender_name,
             "sender_username": sender_uname,
             "chat_type": str(inline_query.chat_type) if hasattr(inline_query, "chat_type") else "unknown",
+            "_created_at": time.time(),
         }
+        # Purge stale inline cache entries older than 5 minutes to prevent memory leak
+        now = time.time()
+        stale = [k for k, v in self.inline_queries_cache.items() if now - v.get("_created_at", 0) > 300]
+        for k in stale:
+            del self.inline_queries_cache[k]
 
         # Show the user's text with a "Express It" button
         results = [
@@ -1694,11 +2210,156 @@ class TelegramBot:
             except Exception:
                 pass
 
+    async def _auto_expiration_worker(self):
+        """Periodically check expiring subscriptions, notify users, and auto-revert expired accounts to Free status."""
+        while True:
+            try:
+                now = datetime.now()
+                candidates = await self.db.get_all_active_premium_candidates()
+                for u in candidates:
+                    user_id = u.get("user_id")
+                    if not user_id or self._is_admin(user_id):
+                        continue
+
+                    premium_until = u.get("premium_until")
+                    if not premium_until:
+                        # No expiration date set -> revert to free
+                        await self.db.users.update_one({"user_id": user_id}, {"$set": {"is_premium": False}})
+                        continue
+
+                    diff = premium_until - now
+                    remaining_days = diff.days
+                    exp_date_str = premium_until.strftime("%B %d, %Y")
+
+                    # 1. Expired Notice
+                    if diff.total_seconds() <= 0:
+                        if not u.get("notified_expired"):
+                            try:
+                                await self.app.send_message(
+                                    chat_id=user_id,
+                                    text=(
+                                        "⏰ **Your GGQT Bot Premium Plan Has Expired** ⏳\n\n"
+                                        "Your 90-day subscription has ended, and your account has been switched back to the **Free Tier**.\n\n"
+                                        "💳 **To Renew Premium & Restore All Features:**\n"
+                                        f"• Send `{self.config.premium_price}` in BNB or USDT (BEP-20) to:\n`{self.config.payment_address}`\n"
+                                        f"• Forward your transaction hash/screenshot to **{self.config.admin_contact}** to reactivate for 90 days!\n\n"
+                                        "Type `/premium` to view all benefits."
+                                    )
+                                )
+                            except Exception as notify_err:
+                                logger.debug(f"Failed to send expiration notification to {user_id}: {notify_err}")
+                            await self.db.users.update_one(
+                                {"user_id": user_id},
+                                {"$set": {"is_premium": False, "notified_expired": True}}
+                            )
+                        else:
+                            await self.db.users.update_one(
+                                {"user_id": user_id},
+                                {"$set": {"is_premium": False}}
+                            )
+
+                    # 2. 1-Day / 24-Hour Urgent Reminder
+                    elif diff.total_seconds() <= 86400:
+                        if not u.get("notified_expiring_1d"):
+                            try:
+                                await self.app.send_message(
+                                    chat_id=user_id,
+                                    text=(
+                                        "🚨 **Urgent Reminder: Your Premium Plan Expires Tomorrow!** ⏳\n\n"
+                                        f"Your subscription will end in less than 24 hours (on **{exp_date_str}**).\n\n"
+                                        "Renew now to maintain uninterrupted access to:\n"
+                                        "• 💻 Aider Code Generation (`/code`)\n"
+                                        "• 📁 Multi-file `.zip` Codebase & PDF analysis\n"
+                                        "• ⚡ Extended 100-message memory & 40,000 char context\n"
+                                        "• 💎 Priority Custom Provider AI Models\n\n"
+                                        f"💰 **Price**: `{self.config.premium_price}` for `{self.config.premium_duration_days} Days`\n"
+                                        f"💳 **Deposit Address** (BSC): `{self.config.payment_address}`\n"
+                                        f"📩 Send payment proof to Admin **{self.config.admin_contact}** to extend!"
+                                    )
+                                )
+                            except Exception as notify_err:
+                                logger.debug(f"Failed to send 1d reminder to {user_id}: {notify_err}")
+                            await self.db.users.update_one(
+                                {"user_id": user_id},
+                                {"$set": {"notified_expiring_1d": True}}
+                            )
+
+                    # 3. 3-Day Friendly Reminder
+                    elif diff.total_seconds() <= 3 * 86400:
+                        if not u.get("notified_expiring_3d"):
+                            try:
+                                await self.app.send_message(
+                                    chat_id=user_id,
+                                    text=(
+                                        f"⚠️ **Notice: Your GGQT Bot Premium Plan Expires in {remaining_days + 1} Days!** ⏳\n\n"
+                                        f"Your 90-day subscription is scheduled to end on **{exp_date_str}**.\n\n"
+                                        "Renew anytime to avoid interruption of your Aider coding and codebase analysis features:\n"
+                                        f"• **Price**: `{self.config.premium_price}` (USDT / BNB equivalent)\n"
+                                        f"• **Deposit Address**: `{self.config.payment_address}`\n"
+                                        f"• **Contact**: Forward receipt to **{self.config.admin_contact}**.\n\n"
+                                        "Type `/premium` to view your subscription status."
+                                    )
+                                )
+                            except Exception as notify_err:
+                                logger.debug(f"Failed to send 3d reminder to {user_id}: {notify_err}")
+                            await self.db.users.update_one(
+                                {"user_id": user_id},
+                                {"$set": {"notified_expiring_3d": True}}
+                            )
+
+                # Batch cleanup any leftover expired users
+                await self.db.cleanup_expired_premium_users()
+            except Exception as e:
+                logger.error(f"Auto-expiration worker error: {e}")
+            await asyncio.sleep(1800)  # Check every 30 minutes
+
+    def _task_exception_handler(self, task: asyncio.Task):
+        """Log unhandled exceptions from background tasks."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc:
+            logger.error(f"Background task '{task.get_name()}' failed with exception: {exc}", exc_info=exc)
+
     async def run(self):
         await self.db.init()
-        # Launch background model discovery non-blockingly so bot starts instantly!
-        asyncio.create_task(self.openai.start_background_model_discovery())
+
+        # Ensure ./temp directory exists and sweep any stale leftovers on startup
+        temp_dir = Path("./temp")
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        for old_f in temp_dir.glob("*"):
+            if old_f.is_file():
+                try:
+                    old_f.unlink()
+                except Exception:
+                    pass
+
+        # Launch background tasks with exception tracking
+        t1 = asyncio.create_task(self.openai.start_background_model_discovery(), name="model_discovery")
+        t1.add_done_callback(self._task_exception_handler)
+        t2 = asyncio.create_task(self._auto_expiration_worker(), name="auto_expiration")
+        t2.add_done_callback(self._task_exception_handler)
+        self._background_tasks.extend([t1, t2])
+
         logger.info(f"Bot starting immediately with default fallback model: '{self.openai.get_current_model()}'")
         await self.app.start()
-        logger.info("Bot started and ready!")
-        await asyncio.Event().wait()  # run forever
+
+        # Cache bot identity once at startup (after client starts)
+        self._bot_me = self.app.me or await self.app.get_me()
+        logger.info(f"Bot started and ready as @{self._bot_me.username if self._bot_me else 'unknown'}!")
+
+        # Graceful shutdown handler
+        stop_event = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, stop_event.set)
+            except NotImplementedError:
+                pass  # Windows doesn't support add_signal_handler
+
+        await stop_event.wait()
+        logger.info("Shutting down gracefully...")
+        for task in self._background_tasks:
+            task.cancel()
+        await self.app.stop()
+        logger.info("Bot stopped cleanly.")
