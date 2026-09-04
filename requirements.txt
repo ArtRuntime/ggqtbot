@@ -11,3 +11,4 @@ httpx
 beautifulsoup4
 duckduckgo_search
 pypdf
+curl_cffi
